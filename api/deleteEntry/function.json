@@ -1,0 +1,6 @@
+{
+  "bindings": [
+    { "authLevel": "anonymous", "type": "httpTrigger", "direction": "in", "name": "req", "methods": ["delete"], "route": "entries/{id}" },
+    { "type": "http", "direction": "out", "name": "res" }
+  ]
+}

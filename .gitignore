@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+api/node_modules/
+
+# Lock files (regenerated on deploy)
+api/package-lock.json
+
+# Generated config (created by deploy.ps1 per-tenant)
+app/staticwebapp.config.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+deploy-log.txt
