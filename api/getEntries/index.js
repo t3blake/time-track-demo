@@ -12,7 +12,23 @@ function getCred() {
   );
 }
 
+// Validate that the caller belongs to the expected tenant.
+// SWA's built-in AAD provider is multi-tenant, so we enforce tenant isolation here.
+function validateTenant(req) {
+  const header = req.headers["x-ms-client-principal"];
+  if (!header) return false;
+  const principal = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
+  const tenantClaim = (principal.claims || []).find(
+    c => c.typ === "http://schemas.microsoft.com/identity/claims/tenantid"
+  );
+  return tenantClaim && tenantClaim.val === process.env.AZURE_TENANT_ID;
+}
+
 module.exports = async function (context, req) {
+  if (!validateTenant(req)) {
+    context.res = { status: 403, headers: { "Content-Type": "application/json" }, body: { error: "Access denied: tenant not allowed" } };
+    return;
+  }
   const url = process.env.TABLE_STORAGE_URL;
   if (!url) {
     context.res = { status: 500, headers: { "Content-Type": "application/json" }, body: { error: "TABLE_STORAGE_URL not configured" } };

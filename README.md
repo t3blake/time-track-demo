@@ -1,6 +1,6 @@
 # Time Entry Demo
 
-A lightweight time-tracking web app built on Azure Static Web Apps with Azure Table Storage for persistence and Entra ID for authentication.
+A lightweight time-tracking web app built on Azure Static Web Apps with Azure Table Storage for persistence and Azure AD authentication.
 
 ![Azure Static Web Apps](https://img.shields.io/badge/Azure-Static%20Web%20Apps-0078D4?logo=microsoft-azure)
 ![Azure Functions](https://img.shields.io/badge/Azure-Functions-0062AD?logo=azure-functions)
@@ -10,7 +10,7 @@ A lightweight time-tracking web app built on Azure Static Web Apps with Azure Ta
 
 - **Single-page time entry UI** — date, project, task, hours, billable flag, notes
 - **Persistent storage** — Azure Table Storage (no SQL database needed)
-- **Entra ID authentication** — locked to your Azure AD tenant
+- **Azure AD authentication** — built-in provider with API-level tenant validation
 - **Serverless API** — Azure Functions (managed by Static Web Apps)
 - **Zero infrastructure to manage** — all serverless, minimal cost
 
@@ -22,15 +22,16 @@ flowchart TB
         UI["index.html<br/>(Single-page app)"]
     end
 
-    subgraph EntraID["Microsoft Entra ID"]
-        OIDC["OpenID Connect<br/>Single-tenant"]
+    subgraph AAD["Microsoft Entra ID<br/>(Built-in AAD provider)"]
+        Login["/.auth/login/aad<br/>Multi-tenant login"]
     end
 
     subgraph AzureSub["Azure Subscription"]
-        subgraph SWA["Azure Static Web Apps"]
+        subgraph SWA["Azure Static Web Apps (Standard)"]
             direction TB
             Static["Static Hosting<br/>(app/)"]
             subgraph Functions["Managed Azure Functions (Node 18)"]
+                Validate["Tenant validation<br/>(x-ms-client-principal)"]
                 GET["GET /api/entries"]
                 POST["POST /api/entries"]
                 DELETE["DELETE /api/entries/{id}"]
@@ -42,15 +43,16 @@ flowchart TB
         end
 
         subgraph RBAC["Entra ID App Registration"]
-            SP["Service Principal<br/>Storage Table Data Contributor"]
+            SP["Service Principal<br/>📜 Certificate credential<br/>Storage Table Data Contributor"]
         end
     end
 
     UI -- "HTTPS" --> Static
-    UI -. "/.auth/login/entra<br/>(302 redirect)" .-> OIDC
-    OIDC -. "ID token + cookie" .-> Static
-    Static -- "/api/*" --> Functions
-    GET & POST & DELETE -- "ClientSecretCredential" --> SP
+    UI -. "/.auth/login/aad<br/>(302 redirect)" .-> Login
+    Login -. "ID token + cookie" .-> Static
+    Static -- "/api/*" --> Validate
+    Validate -- "tenant OK" --> GET & POST & DELETE
+    GET & POST & DELETE -- "ClientCertificateCredential" --> SP
     SP -- "RBAC" --> Table
 ```
 
@@ -59,9 +61,10 @@ flowchart TB
 | Layer | Details |
 |-------|---------|
 | **Front-end** | Single HTML file served by SWA's global CDN. No build step. |
-| **Authentication** | SWA's built-in auth with a custom OpenID Connect provider (Entra ID, single-tenant). Unauthenticated users are redirected to `/.auth/login/entra`. |
+| **Authentication** | SWA's built-in Azure AD provider (`/.auth/login/aad`). No app registration or client secret needed — Microsoft manages it. Any Azure AD user can log in. |
+| **Tenant validation** | Each API function checks the `x-ms-client-principal` header for a matching tenant ID. Users from other tenants get a 403. Combined with your org's Conditional Access policies (e.g., MFA), this provides strong access control. |
 | **API** | Three Azure Functions (managed by SWA, Node 18). Routed automatically via `/api/*`. |
-| **Storage auth** | A service principal with the **Storage Table Data Contributor** RBAC role authenticates via `ClientSecretCredential`. Credentials are stored as SWA app settings (encrypted at rest). |
+| **Storage auth** | A service principal with the **Storage Table Data Contributor** RBAC role authenticates via `ClientCertificateCredential`. The deploy script generates a self-signed certificate — no password credentials needed (compliant with enterprise Entra policies). |
 | **Data** | Azure Table Storage — schema-less, pay-per-use, no database server to manage. |
 
 ## Prerequisites
@@ -73,8 +76,8 @@ flowchart TB
 | **Node.js** | 18+ | `winget install OpenJS.NodeJS.LTS` |
 
 You also need:
-- An Azure subscription (free tier works)
-- Permissions to create app registrations in your Entra ID tenant
+- An Azure subscription
+- An Entra ID user account (app registration permissions are NOT required)
 
 ## Quick Start
 
@@ -91,10 +94,10 @@ az login
 ```
 
 That's it. The script will:
-1. Create a resource group, storage account, and Static Web App
-2. Register Entra ID apps (one for auth, one for Table Storage access)
-3. Configure all app settings
-4. Deploy the app and API
+1. Create a resource group, storage account, and Static Web App (Standard tier)
+2. Create a service principal with a certificate credential for Table Storage access
+3. Generate the SWA config with built-in AAD auth routes
+4. Configure all app settings and deploy the app + API
 
 At the end it prints the URL to open in your browser.
 
@@ -152,7 +155,7 @@ The deploy script creates a **Standard** tier SWA (~$9/month). Standard is requi
 ## Troubleshooting
 
 ### "Too many redirects" after deploying
-The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.config.json`. Without it, unauthenticated requests to `/.auth/login/entra` match the `/*` rule (which requires `authenticated`), triggering a 302 back to `/.auth/login/entra` — an infinite loop. The deploy script handles this automatically.
+The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.config.json`. Without it, unauthenticated requests to `/.auth/login/aad` match the `/*` rule (which requires `authenticated`), triggering a 302 back to `/.auth/login/aad` — an infinite loop. The deploy script handles this automatically.
 
 ### "Could not load entries" or API returns 500
 | Cause | Fix |
@@ -170,7 +173,9 @@ az staticwebapp functions show --name timeentry-demo --resource-group rg-timeent
 
 ## Security Notes
 
-- **Certificate-based authentication**: The API uses `ClientCertificateCredential` with a self-signed certificate to access Table Storage. The deploy script generates a 1-year certificate, uploads the public key to the app registration, and stores the full PEM (base64-encoded) as the `AZURE_CLIENT_CERTIFICATE` app setting (encrypted at rest). No password credentials are used, which complies with enterprise Entra ID policies that block password-based app credentials.
+- **Built-in AAD authentication**: Uses SWA's built-in Azure AD provider (`/.auth/login/aad`). No app registration or client secret is needed for login — Microsoft manages the identity provider entirely. This avoids enterprise Entra policies that block password credentials on app registrations.
+- **API-level tenant validation**: The built-in AAD provider is multi-tenant (any Azure AD user can log in). To restrict access, every API function validates the tenant ID from the `x-ms-client-principal` header against `AZURE_TENANT_ID`. Users from other tenants receive a 403. Combined with your org's tenant-wide Conditional Access policies (MFA, device compliance, etc.), this provides defense in depth.
+- **Certificate-based storage auth**: The API uses `ClientCertificateCredential` with a deploy-time generated self-signed certificate (1-year expiry). The PEM is stored as a base64-encoded app setting (encrypted at rest). No password credentials are created.
 - **Why not managed identity?** SWA managed functions do not expose `IDENTITY_HEADER` or the MSI endpoint to user code. `DefaultAzureCredential` fails entirely. This is a [known platform limitation](https://learn.microsoft.com/en-us/azure/static-web-apps/apis-functions).
 - **Storage network access**: The storage account uses public network access. To fully lock it down, you'd need to replace SWA managed functions with a linked Azure Functions app that supports VNet integration and private endpoints.
 
@@ -182,4 +187,4 @@ To remove all Azure resources:
 ./deploy.ps1 -Teardown
 ```
 
-This deletes the resource group (and everything in it) plus the Entra ID app registrations.
+This deletes the resource group (and everything in it) plus the API service principal app registration.
