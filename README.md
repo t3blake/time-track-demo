@@ -12,7 +12,7 @@ A lightweight time-tracking web app built on Azure Static Web Apps with Azure Ta
 - **Persistent storage** — Azure Table Storage (no SQL database needed)
 - **Entra ID authentication** — locked to your Azure AD tenant
 - **Serverless API** — Azure Functions (managed by Static Web Apps)
-- **Zero infrastructure to manage** — all serverless, free tier eligible
+- **Zero infrastructure to manage** — all serverless, minimal cost
 
 ## Architecture
 
@@ -139,12 +139,13 @@ time-entry-demo/
 
 ## Cost
 
-All resources are free-tier eligible:
-- **Static Web Apps**: Free tier (100 GB bandwidth/month)
-- **Azure Table Storage**: ~$0.045/GB/month (pennies for demo usage)
-- **Azure Functions**: Managed by SWA, included in free tier
+| Resource | Tier | Approximate cost |
+|----------|------|------------------|
+| **Static Web Apps** | Free (default) | $0 — 100 GB bandwidth/month |
+| **Azure Table Storage** | Standard LRS | ~$0.045/GB/month (pennies for demo usage) |
+| **Azure Functions** | Managed by SWA | Included with SWA tier |
 
-> **Tip:** If you upgrade the SWA to Standard ($9/month) for features like custom domains or higher limits, managed identity becomes available for the SWA resource — but note that SWA managed functions **cannot** use the identity at runtime (the `IDENTITY_HEADER` is not exposed to function code). A linked Azure Functions app would be needed for full MI support.
+> **Note:** The deploy script creates a **Free** tier SWA by default. If your organization requires features like custom domains, higher bandwidth, or you want to enable managed identity on the SWA resource, upgrade to **Standard** (~$9/month) in the Azure portal. Be aware that SWA managed functions still **cannot** use the managed identity at runtime — a linked Azure Functions app would be needed for full MI support.
 
 ## Troubleshooting
 
