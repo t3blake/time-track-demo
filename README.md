@@ -16,27 +16,53 @@ A lightweight time-tracking web app built on Azure Static Web Apps with Azure Ta
 
 ## Architecture
 
-```
-                         ┌────────────────────────────────────┐
-  Browser ──HTTPS──▶     │  Azure Static Web Apps (Free tier) │
-                         │                                    │
-                         │  ┌─ app/index.html (front-end)     │
-                         │  │                                 │
-                         │  └─ api/* (Azure Functions, Node 18)
-                         │       • GET    /api/entries         │
-                         │       • POST   /api/entries         │
-                         │       • DELETE /api/entries/{id}    │
-                         └───────────────┬────────────────────┘
-                                         │  ClientSecretCredential
-                                         │  (service principal)
-                                         ▼
-                              ┌──────────────────────┐
-                              │  Azure Table Storage  │
-                              │  (TimeEntries table)  │
-                              └──────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Browser["🌐 Browser"]
+        UI["index.html<br/>(Single-page app)"]
+    end
+
+    subgraph EntraID["Microsoft Entra ID"]
+        OIDC["OpenID Connect<br/>Single-tenant"]
+    end
+
+    subgraph AzureSub["Azure Subscription"]
+        subgraph SWA["Azure Static Web Apps"]
+            direction TB
+            Static["Static Hosting<br/>(app/)"]
+            subgraph Functions["Managed Azure Functions (Node 18)"]
+                GET["GET /api/entries"]
+                POST["POST /api/entries"]
+                DELETE["DELETE /api/entries/{id}"]
+            end
+        end
+
+        subgraph Storage["Azure Storage Account"]
+            Table["Table Storage<br/>TimeEntries"]
+        end
+
+        subgraph RBAC["Entra ID App Registration"]
+            SP["Service Principal<br/>Storage Table Data Contributor"]
+        end
+    end
+
+    UI -- "HTTPS" --> Static
+    UI -. "/.auth/login/entra<br/>(302 redirect)" .-> OIDC
+    OIDC -. "ID token + cookie" .-> Static
+    Static -- "/api/*" --> Functions
+    GET & POST & DELETE -- "ClientSecretCredential" --> SP
+    SP -- "RBAC" --> Table
 ```
 
-**Authentication flow:** Entra ID (single-tenant OIDC) → SWA handles login → API receives authenticated requests. The API authenticates to Table Storage using a service principal with the "Storage Table Data Contributor" role.
+### How it works
+
+| Layer | Details |
+|-------|---------|
+| **Front-end** | Single HTML file served by SWA's global CDN. No build step. |
+| **Authentication** | SWA's built-in auth with a custom OpenID Connect provider (Entra ID, single-tenant). Unauthenticated users are redirected to `/.auth/login/entra`. |
+| **API** | Three Azure Functions (managed by SWA, Node 18). Routed automatically via `/api/*`. |
+| **Storage auth** | A service principal with the **Storage Table Data Contributor** RBAC role authenticates via `ClientSecretCredential`. Credentials are stored as SWA app settings (encrypted at rest). |
+| **Data** | Azure Table Storage — schema-less, pay-per-use, no database server to manage. |
 
 ## Prerequisites
 
