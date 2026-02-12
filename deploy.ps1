@@ -327,7 +327,7 @@ Write-Step "6/8  Generating staticwebapp.config.json..."
 if (-not $SkipAuth) {
     # Uses a custom OpenID Connect provider named 'entra' backed by Entra ID.
     # This gives us single-tenant auth with proper email claims.
-    # Tenant validation is also enforced at the API level (defense in depth).
+    # Auth validation is also enforced at the API level (defense in depth).
     #
     # Route order matters! The /.auth/* route MUST appear before the /* catch-all
     # to prevent an infinite redirect loop.
@@ -376,7 +376,7 @@ if (-not $SkipAuth) {
 $swaConfig | ConvertTo-Json -Depth 10 | Set-Content "$scriptDir\app\staticwebapp.config.json" -Encoding UTF8
 Write-OK "Config written to app/staticwebapp.config.json"
 
-# ── 6. App Settings + API Dependencies ──────────────────────────────────────
+# ── 7. App Settings + API Dependencies ──────────────────────────────────────
 
 Write-Step "7/8  Configuring app settings and installing dependencies..."
 
@@ -403,7 +403,7 @@ npm install --production 2>&1 | Out-Null
 Pop-Location
 Write-OK "API dependencies installed."
 
-# ── 7. Deploy ───────────────────────────────────────────────────────────────
+# ── 8. Deploy ───────────────────────────────────────────────────────────────
 
 Write-Step "8/8  Deploying application..."
 

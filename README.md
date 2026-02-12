@@ -31,7 +31,7 @@ flowchart TB
             direction TB
             Static["Static Hosting<br/>(app/)"]
             subgraph Functions["Managed Azure Functions (Node 18)"]
-                Validate["Tenant validation<br/>(x-ms-client-principal)"]
+                Validate["Auth validation<br/>(x-ms-client-principal)"]
                 GET["GET /api/entries"]
                 POST["POST /api/entries"]
                 DELETE["DELETE /api/entries/{id}"]
@@ -52,7 +52,7 @@ flowchart TB
     UI -. "/.auth/login/entra<br/>(302 redirect)" .-> Login
     Login -. "ID token + cookie" .-> Static
     Static -- "/api/*" --> Validate
-    Validate -- "tenant OK" --> GET & POST & DELETE
+    Validate -- "provider OK" --> GET & POST & DELETE
     GET & POST & DELETE -- "ClientCertificateCredential" --> SP
     SP -- "RBAC" --> Table
 ```
@@ -63,7 +63,7 @@ flowchart TB
 |-------|---------|
 | **Front-end** | Single HTML file served by SWA's global CDN. No build step. |
 | **Authentication** | Custom OIDC provider (`/.auth/login/entra`) backed by a single-tenant Entra ID app registration. The deploy script creates the app, client secret (via Graph API), and configures optional claims automatically. |
-| **Tenant validation** | Each API function also checks the `x-ms-client-principal` header for a matching tenant ID (defense in depth). Users from other tenants get a 403. |
+| **Auth validation** | Each API function checks the `x-ms-client-principal` header to confirm the user authenticated via the custom OIDC provider (defense in depth). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session. |
 | **API** | Three Azure Functions (managed by SWA, Node 18). Routed automatically via `/api/*`. |
 | **Storage auth** | A service principal with the **Storage Table Data Contributor** RBAC role authenticates via `ClientCertificateCredential`. The deploy script generates a self-signed certificate — no password credentials needed (compliant with enterprise Entra policies). |
 | **Data** | Azure Table Storage — schema-less, pay-per-use, no database server to manage. |
@@ -177,7 +177,7 @@ az staticwebapp functions show --name timeentry-demo --resource-group rg-timeent
 
 - **Custom OIDC authentication**: Uses a custom OpenID Connect provider (`/.auth/login/entra`) backed by a single-tenant Entra ID app registration. The deploy script creates the app registration, client secret (via Graph API to bypass policies that block `az ad app credential reset`), API permissions, and optional claims automatically.
 - **Optional claims**: The auth app is configured with optional ID token claims (`email`, `preferred_username`, `upn`) to ensure SWA can identify the user. Without these, SWA returns a 403 `invalidUserInfo` or enters a redirect loop.
-- **API-level tenant validation**: For defense in depth, every API function also validates the tenant ID from the `x-ms-client-principal` header against `AZURE_TENANT_ID`. Users from other tenants receive a 403.
+- **API-level auth validation**: For defense in depth, every API function checks that the `x-ms-client-principal` header confirms the user authenticated via the custom OIDC provider (`identityProvider === "entra"`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session. Note: Custom OIDC providers on SWA do not populate claims in the `x-ms-client-principal` header sent to API functions, so claim-based checks are not possible.
 - **Certificate-based storage auth**: The API uses `ClientCertificateCredential` with a deploy-time generated self-signed certificate (1-year expiry). The PEM is stored as a base64-encoded app setting (encrypted at rest). No password credentials are created for the API service principal.
 - **Why not managed identity?** SWA managed functions do not expose `IDENTITY_HEADER` or the MSI endpoint to user code. `DefaultAzureCredential` fails entirely. This is a [known platform limitation](https://learn.microsoft.com/en-us/azure/static-web-apps/apis-functions).
 - **Storage network access**: The storage account uses public network access. To fully lock it down, you'd need to replace SWA managed functions with a linked Azure Functions app that supports VNet integration and private endpoints.
