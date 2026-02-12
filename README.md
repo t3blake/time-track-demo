@@ -169,8 +169,8 @@ The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.
 
 ### Checking API logs
 ```powershell
-# Stream live logs from the SWA
-az staticwebapp functions show --name timeentry-demo --resource-group rg-timeentry-demo
+# Stream live logs from the SWA (replace <prefix> with your prefix)
+az staticwebapp functions show --name <prefix>-demo --resource-group rg-<prefix>-demo
 ```
 
 ## Security Notes
@@ -187,7 +187,8 @@ az staticwebapp functions show --name timeentry-demo --resource-group rg-timeent
 To remove all Azure resources:
 
 ```powershell
-./deploy.ps1 -Teardown
+./deploy.ps1 -Prefix jsmith -Teardown
 ```
 
 This deletes the resource group (and everything in it) plus all Entra ID app registrations.
+Use the same `-Prefix` you used when deploying.
