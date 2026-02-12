@@ -174,9 +174,43 @@ az ad sp create --id $apiAppId 2>$null | Out-Null
 $spObjectId = az ad sp show --id $apiAppId --query id -o tsv
 
 # Create a client secret (1-year expiry)
-$apiCred = az ad app credential reset --id $apiAppId --append `
-    --display-name "deploy-$(Get-Date -Format 'yyyyMMdd')" --years 1 -o json | ConvertFrom-Json
-$apiSecret = $apiCred.password
+# Some tenants have a policy blocking password credentials on app registrations.
+# If that happens, fall back to a certificate-based credential.
+$apiSecret = $null
+try {
+    $apiCred = az ad app credential reset --id $apiAppId --append `
+        --display-name "deploy-$(Get-Date -Format 'yyyyMMdd')" --years 1 -o json 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $apiCred = $apiCred | ConvertFrom-Json
+        $apiSecret = $apiCred.password
+        Write-OK "Password credential created for API service principal."
+    } else {
+        throw "Password credential blocked"
+    }
+} catch {
+    Write-Warn "Password credential blocked by policy — creating self-signed certificate credential..."
+    $certName = "$apiAppName-cert"
+    $cert = New-SelfSignedCertificate `
+        -Subject "CN=$certName" `
+        -CertStoreLocation "Cert:\CurrentUser\My" `
+        -KeyExportPolicy Exportable `
+        -NotAfter (Get-Date).AddYears(1) `
+        -KeySpec Signature `
+        -HashAlgorithm SHA256
+    $certThumbprint = $cert.Thumbprint
+    $certPath = "$scriptDir\$certName.pem"
+    # Export public key and upload to app registration
+    $pemContent = [Convert]::ToBase64String($cert.RawData)
+    az ad app credential reset --id $apiAppId --cert $pemContent --append -o none 2>$null
+    # Export PFX for the ClientCertificateCredential
+    $pfxPath = "$scriptDir\$certName.pfx"
+    $emptyPwd = New-Object System.Security.SecureString
+    Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $emptyPwd | Out-Null
+    $apiCertPath = $pfxPath
+    Write-OK "Certificate credential created (thumbprint: $certThumbprint)."
+    Write-Warn "The API will need to be updated to use ClientCertificateCredential."
+    Write-Warn "Certificate exported to: $pfxPath"
+}
 
 # Assign "Storage Table Data Contributor" role on the storage account
 $storageId = az storage account show --name $storageName --resource-group $rgName --query id -o tsv
@@ -198,6 +232,21 @@ az staticwebapp create `
     --sku Standard `
     -o none 2>$null
 Write-OK "Static Web App '$swaName' created (Standard tier)."
+
+# Enable system-assigned managed identity.
+# NOTE: MI is not usable by SWA managed function code at runtime, but enabling
+# it is good practice and may be required by organizational policies.
+Write-Host "  Enabling managed identity..."
+$miResult = az staticwebapp identity assign `
+    --name $swaName `
+    --resource-group $rgName `
+    --identities [system] `
+    -o json 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-OK "System-assigned managed identity enabled."
+} else {
+    Write-Warn "Could not enable managed identity (non-blocking). $miResult"
+}
 
 $swaHostname = az staticwebapp show --name $swaName --resource-group $rgName --query "defaultHostname" -o tsv
 $swaUrl = "https://$swaHostname"
@@ -227,9 +276,23 @@ if (-not $SkipAuth) {
         $entraClientId = $authApp.appId
     }
 
-    $authCred = az ad app credential reset --id $entraClientId --append `
-        --display-name "swa-auth" --years 1 -o json | ConvertFrom-Json
-    $entraSecret = $authCred.password
+    # Some tenants block password credentials via policy.
+    $entraSecret = $null
+    try {
+        $authCredResult = az ad app credential reset --id $entraClientId --append `
+            --display-name "swa-auth" --years 1 -o json 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $authCred = $authCredResult | ConvertFrom-Json
+            $entraSecret = $authCred.password
+        } else {
+            throw "Password credential blocked"
+        }
+    } catch {
+        Write-Warn "Password credential blocked by policy for auth app."
+        Write-Warn "You will need to manually create a certificate or federated credential"
+        Write-Warn "for the auth app '$authAppName' in the Azure portal."
+        $entraSecret = "REPLACE_WITH_MANUAL_SECRET"
+    }
     Write-OK "Entra auth app ready: $entraClientId"
 } else {
     Write-Step "5/8  Skipping Entra ID authentication (--SkipAuth)."
@@ -297,12 +360,21 @@ Write-Step "7/8  Configuring app settings and installing dependencies..."
 $settings = @(
     "AZURE_TENANT_ID=$tenantId",
     "AZURE_CLIENT_ID=$apiAppId",
-    "AZURE_CLIENT_SECRET=$apiSecret",
     "TABLE_STORAGE_URL=$storageUrl"
 )
+if ($apiSecret) {
+    $settings += "AZURE_CLIENT_SECRET=$apiSecret"
+} else {
+    Write-Warn "AZURE_CLIENT_SECRET not set — certificate credential was used."
+    Write-Warn "You must configure the API to use ClientCertificateCredential."
+}
 if (-not $SkipAuth) {
     $settings += "ENTRA_CLIENT_ID=$entraClientId"
-    $settings += "ENTRA_CLIENT_SECRET=$entraSecret"
+    if ($entraSecret -and $entraSecret -ne "REPLACE_WITH_MANUAL_SECRET") {
+        $settings += "ENTRA_CLIENT_SECRET=$entraSecret"
+    } else {
+        Write-Warn "ENTRA_CLIENT_SECRET not set — add it manually in Azure portal."
+    }
 }
 
 az staticwebapp appsettings set `
