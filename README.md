@@ -13,6 +13,7 @@ A lightweight time-tracking web app built on Azure Static Web Apps with Azure Ta
 - **Azure AD authentication** — custom OIDC provider with single-tenant Entra ID
 - **Serverless API** — Azure Functions (managed by Static Web Apps)
 - **Zero infrastructure to manage** — all serverless, minimal cost
+<img width="895" height="983" alt="image" src="https://github.com/user-attachments/assets/04ef8600-d064-49dd-9aae-6af57a4adf11" />
 
 ## Architecture
 
