@@ -35,11 +35,26 @@ function Write-OK($msg)   { Write-Host "  ✅ $msg" -ForegroundColor Green }
 function Write-Warn($msg) { Write-Host "  ⚠️  $msg" -ForegroundColor Yellow }
 function Write-Err($msg)  { Write-Host "  ❌ $msg" -ForegroundColor Red }
 
-function Assert-Tool($cmd, $name, $installHint) {
+function Assert-Tool($cmd, $name, $wingetId) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
-        Write-Err "$name is required but not found."
-        if ($installHint) { Write-Host "    Install: $installHint" -ForegroundColor DarkGray }
-        exit 1
+        if ($wingetId -and (Get-Command "winget" -ErrorAction SilentlyContinue)) {
+            Write-Warn "$name not found. Installing via winget..."
+            winget install --id $wingetId --accept-source-agreements --accept-package-agreements --silent 2>&1 | Out-Null
+            # Refresh PATH so the current session can find the newly installed tool
+            $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            $userPath    = [Environment]::GetEnvironmentVariable("Path", "User")
+            $env:Path    = "$machinePath;$userPath"
+            if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+                Write-Err "$name was installed but is still not found in PATH."
+                Write-Err "Close and reopen PowerShell, then re-run this script."
+                exit 1
+            }
+            Write-OK "$name installed successfully."
+        } else {
+            Write-Err "$name is required but not found."
+            if ($wingetId) { Write-Host "    Install: winget install --id $wingetId" -ForegroundColor DarkGray }
+            exit 1
+        }
     }
 }
 
@@ -75,9 +90,9 @@ if (-not $Prefix) {
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
 
-Assert-Tool "az"   "Azure CLI"   "winget install Microsoft.AzureCLI"
-Assert-Tool "node" "Node.js"     "winget install OpenJS.NodeJS.LTS"
-Assert-Tool "npm"  "npm"         "(included with Node.js)"
+Assert-Tool "az"   "Azure CLI"   "Microsoft.AzureCLI"
+Assert-Tool "node" "Node.js"     "OpenJS.NodeJS.LTS"
+Assert-Tool "npm"  "npm"         $null  # included with Node.js
 
 Write-Step "Checking Azure CLI login..."
 $account = az account show --query "{name:name, id:id, tenantId:tenantId}" -o json 2>$null | ConvertFrom-Json
