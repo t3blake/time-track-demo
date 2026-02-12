@@ -173,44 +173,38 @@ if ($existingApp) {
 az ad sp create --id $apiAppId 2>$null | Out-Null
 $spObjectId = az ad sp show --id $apiAppId --query id -o tsv
 
-# Create a client secret (1-year expiry)
-# Some tenants have a policy blocking password credentials on app registrations.
-# If that happens, fall back to a certificate-based credential.
-$apiSecret = $null
-try {
-    $apiCred = az ad app credential reset --id $apiAppId --append `
-        --display-name "deploy-$(Get-Date -Format 'yyyyMMdd')" --years 1 -o json 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $apiCred = $apiCred | ConvertFrom-Json
-        $apiSecret = $apiCred.password
-        Write-OK "Password credential created for API service principal."
-    } else {
-        throw "Password credential blocked"
-    }
-} catch {
-    Write-Warn "Password credential blocked by policy — creating self-signed certificate credential..."
-    $certName = "$apiAppName-cert"
-    $cert = New-SelfSignedCertificate `
-        -Subject "CN=$certName" `
-        -CertStoreLocation "Cert:\CurrentUser\My" `
-        -KeyExportPolicy Exportable `
-        -NotAfter (Get-Date).AddYears(1) `
-        -KeySpec Signature `
-        -HashAlgorithm SHA256
-    $certThumbprint = $cert.Thumbprint
-    $certPath = "$scriptDir\$certName.pem"
-    # Export public key and upload to app registration
-    $pemContent = [Convert]::ToBase64String($cert.RawData)
-    az ad app credential reset --id $apiAppId --cert $pemContent --append -o none 2>$null
-    # Export PFX for the ClientCertificateCredential
-    $pfxPath = "$scriptDir\$certName.pfx"
-    $emptyPwd = New-Object System.Security.SecureString
-    Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $emptyPwd | Out-Null
-    $apiCertPath = $pfxPath
-    Write-OK "Certificate credential created (thumbprint: $certThumbprint)."
-    Write-Warn "The API will need to be updated to use ClientCertificateCredential."
-    Write-Warn "Certificate exported to: $pfxPath"
-}
+# Create a self-signed certificate credential (1-year expiry).
+# Certificate credentials are used instead of passwords because most enterprise
+# tenants have Entra policies that block password credentials on app registrations.
+Write-Host "  Generating self-signed certificate..."
+$certSubject = "CN=$apiAppName"
+$cert = New-SelfSignedCertificate `
+    -Subject $certSubject `
+    -CertStoreLocation "Cert:\CurrentUser\My" `
+    -KeyExportPolicy Exportable `
+    -NotAfter (Get-Date).AddYears(1) `
+    -KeyAlgorithm RSA -KeyLength 2048 `
+    -HashAlgorithm SHA256
+
+# Upload public key to the app registration
+$certBase64 = [Convert]::ToBase64String($cert.RawData)
+az ad app credential reset --id $apiAppId --cert $certBase64 --append -o none 2>$null
+
+# Build PEM string (certificate + private key) for the API to use at runtime
+$certPemBody = [Convert]::ToBase64String($cert.RawData, [System.Base64FormattingOptions]::InsertLineBreaks)
+$certPem = "-----BEGIN CERTIFICATE-----`n$certPemBody`n-----END CERTIFICATE-----"
+$rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+$keyBytes = $rsa.ExportPkcs8PrivateKey()
+$keyPemBody = [Convert]::ToBase64String($keyBytes, [System.Base64FormattingOptions]::InsertLineBreaks)
+$keyPem = "-----BEGIN PRIVATE KEY-----`n$keyPemBody`n-----END PRIVATE KEY-----"
+$fullPem = $certPem + "`n" + $keyPem
+
+# Base64-encode the full PEM so it can be stored as a single app setting
+$apiCertB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($fullPem))
+
+# Clean up from local cert store
+Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
+Write-OK "Certificate credential created (thumbprint: $($cert.Thumbprint))."
 
 # Assign "Storage Table Data Contributor" role on the storage account
 $storageId = az storage account show --name $storageName --resource-group $rgName --query id -o tsv
