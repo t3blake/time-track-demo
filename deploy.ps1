@@ -3,6 +3,7 @@
 #   - Azure Table Storage for persistence
 #   - Entra ID (single-tenant) authentication
 #   - Azure Functions API backend
+#   - Service principal auth for Table Storage access
 #
 # Prerequisites:
 #   - Azure CLI (az) installed and logged in
@@ -10,10 +11,11 @@
 #   - PowerShell 7+
 #
 # Usage:
-#   ./deploy.ps1                          # Interactive - prompts for everything
+#   ./deploy.ps1                          # Deploy with defaults
 #   ./deploy.ps1 -Location westus2        # Override region
 #   ./deploy.ps1 -Prefix myteam          # Custom resource prefix
-#   ./deploy.ps1 -SkipAuth               # Skip Entra ID setup (leave app open)
+#   ./deploy.ps1 -SkipAuth               # Skip Entra ID setup (anonymous access)
+#   ./deploy.ps1 -Teardown               # Remove all resources
 
 param(
     [string]$Prefix = "timeentry",
@@ -26,29 +28,38 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 function Write-Step($msg) { Write-Host "`n🔷 $msg" -ForegroundColor Cyan }
 function Write-OK($msg)   { Write-Host "  ✅ $msg" -ForegroundColor Green }
 function Write-Warn($msg) { Write-Host "  ⚠️  $msg" -ForegroundColor Yellow }
 function Write-Err($msg)  { Write-Host "  ❌ $msg" -ForegroundColor Red }
 
-function Assert-Tool($cmd, $name) {
+function Assert-Tool($cmd, $name, $installHint) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
-        Write-Err "$name is required but not found. Please install it first."
+        Write-Err "$name is required but not found."
+        if ($installHint) { Write-Host "    Install: $installHint" -ForegroundColor DarkGray }
         exit 1
     }
 }
 
-# ── Pre-flight checks ───────────────────────────────────────────────────────
+function Get-ScriptDir {
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    return Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+
+# ── Banner ───────────────────────────────────────────────────────────────────
+
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
 Write-Host "║          Time Entry Demo - Deployment Script            ║" -ForegroundColor Cyan
 Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
-Assert-Tool "az" "Azure CLI"
-Assert-Tool "node" "Node.js"
-Assert-Tool "npm" "npm"
+# ── Pre-flight checks ───────────────────────────────────────────────────────
 
-# Verify logged in
+Assert-Tool "az"   "Azure CLI"   "winget install Microsoft.AzureCLI"
+Assert-Tool "node" "Node.js"     "winget install OpenJS.NodeJS.LTS"
+Assert-Tool "npm"  "npm"         "(included with Node.js)"
+
 Write-Step "Checking Azure CLI login..."
 $account = az account show --query "{name:name, id:id, tenantId:tenantId}" -o json 2>$null | ConvertFrom-Json
 if (-not $account) {
@@ -56,19 +67,21 @@ if (-not $account) {
     az login | Out-Null
     $account = az account show --query "{name:name, id:id, tenantId:tenantId}" -o json | ConvertFrom-Json
 }
-Write-OK "Logged in to: $($account.name)"
-Write-OK "Subscription: $($account.id)"
-Write-OK "Tenant ID:    $($account.tenantId)"
+Write-OK "Subscription: $($account.name) ($($account.id))"
+Write-OK "Tenant:       $($account.tenantId)"
+
+$subId    = $account.id
 $tenantId = $account.tenantId
 
 # ── Resource names ───────────────────────────────────────────────────────────
-$rgName       = "rg-$Prefix-demo"
-$swaName      = "$Prefix-demo"
-$storageName  = ($Prefix -replace '[^a-z0-9]','') + "store"
-# Storage account names must be 3-24 chars, lowercase alphanumeric only
+
+$rgName      = "rg-$Prefix-demo"
+$swaName     = "$Prefix-demo"
+$storageName = ($Prefix -replace '[^a-z0-9]','') + "demostore"
 if ($storageName.Length -gt 24) { $storageName = $storageName.Substring(0, 24) }
-$authAppName  = "$Prefix-swa-auth"
-$apiAppName   = "$Prefix-table-api"
+$authAppName = "$Prefix-swa-auth"
+$apiAppName  = "$Prefix-table-api"
+$scriptDir   = Get-ScriptDir
 
 Write-Step "Resource plan:"
 Write-Host "  Resource Group:   $rgName"
@@ -76,112 +89,163 @@ Write-Host "  Static Web App:   $swaName"
 Write-Host "  Storage Account:  $storageName"
 Write-Host "  Location:         $Location"
 if (-not $SkipAuth) { Write-Host "  Auth App:         $authAppName (single-tenant)" }
+Write-Host "  API App:          $apiAppName"
 Write-Host ""
 
-# ── Teardown mode ────────────────────────────────────────────────────────────
+# ── Teardown ─────────────────────────────────────────────────────────────────
+
 if ($Teardown) {
     Write-Step "Tearing down all resources..."
-    Write-Warn "This will delete resource group '$rgName' and all its contents."
+    Write-Warn "This will delete resource group '$rgName' and all Entra app registrations."
     $confirm = Read-Host "Type 'yes' to confirm"
     if ($confirm -ne 'yes') { Write-Host "Aborted."; exit 0 }
 
-    # Delete Entra app registrations
-    $apps = az ad app list --display-name $authAppName --query "[].appId" -o tsv 2>$null
-    foreach ($appId in $apps) {
-        Write-Host "  Deleting app registration $appId..."
-        az ad app delete --id $appId 2>$null
-    }
-    $apps = az ad app list --display-name $apiAppName --query "[].appId" -o tsv 2>$null
-    foreach ($appId in $apps) {
-        Write-Host "  Deleting app registration $appId..."
-        az ad app delete --id $appId 2>$null
+    foreach ($appName in @($authAppName, $apiAppName)) {
+        $apps = az ad app list --display-name $appName --query "[].appId" -o tsv 2>$null
+        foreach ($appId in $apps) {
+            Write-Host "  Deleting app registration $appId ($appName)..."
+            az ad app delete --id $appId 2>$null
+        }
     }
 
-    az group delete --name $rgName --yes --no-wait 2>$null
-    Write-OK "Teardown initiated. Resources will be deleted in the background."
+    $rgExists = az group exists --name $rgName -o tsv 2>$null
+    if ($rgExists -eq "true") {
+        az group delete --name $rgName --yes --no-wait 2>$null
+        Write-OK "Resource group deletion initiated (runs in background)."
+    } else {
+        Write-Warn "Resource group '$rgName' not found — nothing to delete."
+    }
+
+    Write-OK "Teardown complete."
     exit 0
 }
 
-# ── 1. Resource Group ────────────────────────────────────────────────────────
-Write-Step "Creating resource group '$rgName' in $Location..."
-az group create --name $rgName --location $Location -o none
-Write-OK "Resource group ready."
+# ═════════════════════════════════════════════════════════════════════════════
+#  DEPLOYMENT
+# ═════════════════════════════════════════════════════════════════════════════
 
-# ── 2. Storage Account ───────────────────────────────────────────────────────
-Write-Step "Creating storage account '$storageName'..."
+# ── 1. Resource Group ────────────────────────────────────────────────────────
+
+Write-Step "1/8  Creating resource group..."
+az group create --name $rgName --location $Location -o none
+Write-OK "Resource group '$rgName' ready."
+
+# ── 2. Storage Account + Table ───────────────────────────────────────────────
+
+Write-Step "2/8  Creating storage account and table..."
 az storage account create `
     --name $storageName `
     --resource-group $rgName `
     --location $Location `
     --sku Standard_LRS `
     --min-tls-version TLS1_2 `
+    --allow-blob-public-access false `
     -o none
-Write-OK "Storage account created."
+Write-OK "Storage account '$storageName' created."
 
 $storageUrl = "https://$storageName.table.core.windows.net"
 
-# Create TimeEntries table via ARM (data-plane createTable requires higher permissions)
-$subId = $account.id
+# Create the TimeEntries table via ARM management plane.
+# NOTE: The "Storage Table Data Contributor" RBAC role only grants entity-level
+# operations (read/write/delete rows), NOT table creation. The createTable call
+# in the API code handles this gracefully (catches 403), but we create the table
+# at deploy time to ensure it exists without requiring elevated permissions.
 az rest --method PUT `
     --url "/subscriptions/$subId/resourceGroups/$rgName/providers/Microsoft.Storage/storageAccounts/$storageName/tableServices/default/tables/TimeEntries?api-version=2023-01-01" `
     --body '{}' -o none 2>$null
-Write-OK "TimeEntries table ensured."
+Write-OK "TimeEntries table created."
 
-# ── 3. Service principal for Table Storage access ────────────────────────────
-Write-Step "Creating service principal '$apiAppName' for Table Storage..."
-$apiApp = az ad app create --display-name $apiAppName -o json | ConvertFrom-Json
-$apiAppId = $apiApp.appId
+# ── 3. Service Principal for Table Storage ───────────────────────────────────
 
-# Ensure service principal exists
-az ad sp create --id $apiAppId 2>$null
+Write-Step "3/8  Creating service principal for Table Storage access..."
+
+# Create (or find existing) app registration
+$existingApp = az ad app list --display-name $apiAppName --query "[0].appId" -o tsv 2>$null
+if ($existingApp) {
+    $apiAppId = $existingApp
+    Write-Host "  Using existing app registration: $apiAppId"
+} else {
+    $apiApp = az ad app create --display-name $apiAppName -o json | ConvertFrom-Json
+    $apiAppId = $apiApp.appId
+}
+
+# Ensure service principal exists (idempotent — silently ignores "already exists")
+az ad sp create --id $apiAppId 2>$null | Out-Null
 $spObjectId = az ad sp show --id $apiAppId --query id -o tsv
 
-# Create client secret
-$apiCred = az ad app credential reset --id $apiAppId --append --display-name "deploy" --years 1 -o json | ConvertFrom-Json
+# Create a client secret (1-year expiry)
+$apiCred = az ad app credential reset --id $apiAppId --append `
+    --display-name "deploy-$(Get-Date -Format 'yyyyMMdd')" --years 1 -o json | ConvertFrom-Json
 $apiSecret = $apiCred.password
 
-# Assign Storage Table Data Contributor role
+# Assign "Storage Table Data Contributor" role on the storage account
 $storageId = az storage account show --name $storageName --resource-group $rgName --query id -o tsv
 az role assignment create `
     --assignee-object-id $spObjectId `
     --assignee-principal-type ServicePrincipal `
     --role "Storage Table Data Contributor" `
     --scope $storageId `
-    -o none
-Write-OK "Service principal created and role assigned."
+    -o none 2>$null
+Write-OK "Service principal '$apiAppName' ready with Storage Table Data Contributor role."
 
 # ── 4. Static Web App ───────────────────────────────────────────────────────
-Write-Step "Creating Static Web App '$swaName'..."
-az staticwebapp create --name $swaName --resource-group $rgName --location $Location -o none 2>$null
-Write-OK "Static Web App created."
+
+Write-Step "4/8  Creating Static Web App..."
+az staticwebapp create `
+    --name $swaName `
+    --resource-group $rgName `
+    --location $Location `
+    -o none 2>$null
+Write-OK "Static Web App '$swaName' created (Free tier)."
 
 $swaHostname = az staticwebapp show --name $swaName --resource-group $rgName --query "defaultHostname" -o tsv
 $swaUrl = "https://$swaHostname"
 Write-OK "URL: $swaUrl"
 
-# ── 5. Entra ID Authentication (optional) ───────────────────────────────────
+# ── 5. Entra ID Authentication ──────────────────────────────────────────────
+
 $entraClientId = ""
 $entraSecret = ""
 
 if (-not $SkipAuth) {
-    Write-Step "Creating single-tenant Entra ID app '$authAppName'..."
-    $authApp = az ad app create `
-        --display-name $authAppName `
-        --sign-in-audience AzureADMyOrg `
-        --web-redirect-uris "$swaUrl/.auth/login/entra/callback" `
-        -o json | ConvertFrom-Json
-    $entraClientId = $authApp.appId
+    Write-Step "5/8  Configuring Entra ID authentication..."
 
-    $authCred = az ad app credential reset --id $entraClientId --append --display-name "swa-auth" --years 1 -o json | ConvertFrom-Json
+    $existingAuth = az ad app list --display-name $authAppName --query "[0].appId" -o tsv 2>$null
+    if ($existingAuth) {
+        $entraClientId = $existingAuth
+        # Update redirect URI in case SWA hostname changed
+        az ad app update --id $entraClientId `
+            --web-redirect-uris "$swaUrl/.auth/login/entra/callback" 2>$null
+        Write-Host "  Using existing auth app: $entraClientId"
+    } else {
+        $authApp = az ad app create `
+            --display-name $authAppName `
+            --sign-in-audience AzureADMyOrg `
+            --web-redirect-uris "$swaUrl/.auth/login/entra/callback" `
+            -o json | ConvertFrom-Json
+        $entraClientId = $authApp.appId
+    }
+
+    $authCred = az ad app credential reset --id $entraClientId --append `
+        --display-name "swa-auth" --years 1 -o json | ConvertFrom-Json
     $entraSecret = $authCred.password
-    Write-OK "Auth app created: $entraClientId"
+    Write-OK "Entra auth app ready: $entraClientId"
+} else {
+    Write-Step "5/8  Skipping Entra ID authentication (--SkipAuth)."
+    Write-Warn "The app will be accessible to anyone with the URL."
 }
 
 # ── 6. Generate staticwebapp.config.json ─────────────────────────────────────
-Write-Step "Generating staticwebapp.config.json..."
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+Write-Step "6/8  Generating staticwebapp.config.json..."
 
 if (-not $SkipAuth) {
+    # Route order matters! SWA evaluates routes top-to-bottom.
+    #
+    # KEY FIX: The /.auth/* route MUST appear before the /* catch-all.
+    # Without it, unauthenticated requests to /.auth/login/entra are caught
+    # by the /* rule (which requires "authenticated"), triggering a 401,
+    # which redirects back to /.auth/login/entra — causing an infinite loop.
     $swaConfig = @{
         auth = @{
             identityProviders = @{
@@ -203,11 +267,11 @@ if (-not $SkipAuth) {
             }
         }
         routes = @(
-            @{ route = "/.auth/login/github"; statusCode = 404 }
+            @{ route = "/.auth/login/github";  statusCode = 404 }
             @{ route = "/.auth/login/twitter"; statusCode = 404 }
-            @{ route = "/.auth/login/aad"; statusCode = 404 }
+            @{ route = "/.auth/login/aad";     statusCode = 404 }
             @{ route = "/.auth/*"; allowedRoles = @("anonymous", "authenticated") }
-            @{ route = "/*"; allowedRoles = @("authenticated") }
+            @{ route = "/*";       allowedRoles = @("authenticated") }
         )
         responseOverrides = @{
             "401" = @{ redirect = "/.auth/login/entra"; statusCode = 302 }
@@ -223,17 +287,12 @@ if (-not $SkipAuth) {
 }
 
 $swaConfig | ConvertTo-Json -Depth 10 | Set-Content "$scriptDir\app\staticwebapp.config.json" -Encoding UTF8
-Write-OK "Config generated."
+Write-OK "Config written to app/staticwebapp.config.json"
 
-# ── 7. Install API dependencies ──────────────────────────────────────────────
-Write-Step "Installing API dependencies..."
-Push-Location "$scriptDir\api"
-npm install --production 2>&1 | Out-Null
-Pop-Location
-Write-OK "Dependencies installed."
+# ── 7. App Settings + API Dependencies ──────────────────────────────────────
 
-# ── 8. Set app settings ─────────────────────────────────────────────────────
-Write-Step "Configuring app settings..."
+Write-Step "7/8  Configuring app settings and installing dependencies..."
+
 $settings = @(
     "AZURE_TENANT_ID=$tenantId",
     "AZURE_CLIENT_ID=$apiAppId",
@@ -252,36 +311,45 @@ az staticwebapp appsettings set `
     -o none
 Write-OK "App settings configured."
 
-# ── 9. Deploy ───────────────────────────────────────────────────────────────
-Write-Step "Deploying application..."
-$deployToken = az staticwebapp secrets list --name $swaName --resource-group $rgName --query "properties.apiKey" -o tsv
+Push-Location "$scriptDir\api"
+npm install --production 2>&1 | Out-Null
+Pop-Location
+Write-OK "API dependencies installed."
 
-# Get or download StaticSitesClient
+# ── 8. Deploy ───────────────────────────────────────────────────────────────
+
+Write-Step "8/8  Deploying application..."
+
+$deployToken = az staticwebapp secrets list `
+    --name $swaName `
+    --resource-group $rgName `
+    --query "properties.apiKey" -o tsv
+
+# Locate StaticSitesClient.exe (downloaded by SWA CLI)
 $swaCliDir = "$env:USERPROFILE\.swa\deploy"
 $sscExe = $null
 if (Test-Path $swaCliDir) {
-    $sscExe = Get-ChildItem $swaCliDir -Filter "StaticSitesClient.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+    $sscExe = Get-ChildItem $swaCliDir -Filter "StaticSitesClient.exe" -Recurse -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
 }
 
+# If not found, install SWA CLI to get the deployment binary
 if (-not $sscExe) {
-    Write-Host "  Installing SWA CLI to get deployment client..."
+    Write-Host "  Installing SWA CLI..."
     npm install -g @azure/static-web-apps-cli 2>&1 | Out-Null
-    # Trigger SWA CLI to download StaticSitesClient
-    $env:SWA_CLI_DEPLOY_BINARY = "true"
     swa --version 2>$null | Out-Null
-    swa deploy --print-token 2>$null | Out-Null
-    Start-Sleep -Seconds 2
-    $sscExe = Get-ChildItem $swaCliDir -Filter "StaticSitesClient.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    Start-Sleep -Seconds 3
+    if (Test-Path $swaCliDir) {
+        $sscExe = Get-ChildItem $swaCliDir -Filter "StaticSitesClient.exe" -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
 }
 
-if (-not $sscExe) {
-    Write-Err "Could not find StaticSitesClient.exe. Trying SWA CLI deploy instead..."
-    $env:FUNCTION_LANGUAGE = "node"
-    $env:FUNCTION_LANGUAGE_VERSION = "18"
-    swa deploy "$scriptDir\app" --api-location "$scriptDir\api" --deployment-token $deployToken 2>&1
-} else {
-    $env:FUNCTION_LANGUAGE = "node"
-    $env:FUNCTION_LANGUAGE_VERSION = "18"
+$env:FUNCTION_LANGUAGE = "node"
+$env:FUNCTION_LANGUAGE_VERSION = "18"
+
+if ($sscExe) {
+    Write-Host "  Using StaticSitesClient for deployment..."
     & $sscExe upload `
         --app "$scriptDir\app" `
         --api "$scriptDir\api" `
@@ -289,22 +357,36 @@ if (-not $sscExe) {
         --skipAppBuild true `
         --skipApiBuild true 2>&1 | ForEach-Object {
             if ($_ -match "Status: Succeeded") { Write-OK $_ }
-            elseif ($_ -match "Status:") { Write-Host "  $_" }
+            elseif ($_ -match "Status:")        { Write-Host "  $_" }
             elseif ($_ -match "Visit your site") { Write-OK $_ }
         }
+} elseif (Get-Command "swa" -ErrorAction SilentlyContinue) {
+    Write-Host "  Using SWA CLI for deployment..."
+    swa deploy "$scriptDir\app" `
+        --api-location "$scriptDir\api" `
+        --deployment-token $deployToken 2>&1 | ForEach-Object {
+            if ($_ -match "Project deployed") { Write-OK $_ }
+            else { Write-Host "  $_" }
+        }
+} else {
+    Write-Err "No deployment tool found (StaticSitesClient or SWA CLI)."
+    Write-Err "Install the SWA CLI manually:  npm install -g @azure/static-web-apps-cli"
+    exit 1
 }
 
 # ── Done ─────────────────────────────────────────────────────────────────────
+
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║                  Deployment Complete!                    ║" -ForegroundColor Green
+Write-Host "║                  Deployment Complete!                   ║" -ForegroundColor Green
 Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
-Write-Host "  🌐 App URL:        $swaUrl" -ForegroundColor White
-Write-Host "  📦 Resource Group: $rgName" -ForegroundColor White
-Write-Host "  📊 Storage:        $storageName" -ForegroundColor White
+Write-Host "  🌐 App URL:        $swaUrl"       -ForegroundColor White
+Write-Host "  📦 Resource Group: $rgName"        -ForegroundColor White
+Write-Host "  📊 Storage:        $storageName"   -ForegroundColor White
+Write-Host "  🔑 API SP:         $apiAppName"    -ForegroundColor White
 if (-not $SkipAuth) {
-    Write-Host "  🔒 Auth:          Single-tenant ($tenantId)" -ForegroundColor White
+    Write-Host "  🔒 Auth:          Entra ID single-tenant ($tenantId)" -ForegroundColor White
 }
 Write-Host ""
 Write-Host "  To tear down all resources:" -ForegroundColor DarkGray

@@ -17,16 +17,26 @@ A lightweight time-tracking web app built on Azure Static Web Apps with Azure Ta
 ## Architecture
 
 ```
-Browser → Azure Static Web Apps (Free)
-              ├── app/index.html (front-end)
-              └── api/ (Azure Functions)
-                    ├── GET    /api/entries
-                    ├── POST   /api/entries
-                    └── DELETE /api/entries/{id}
-                          ↓
-                  Azure Table Storage
-                  (Entra ID service principal auth)
+                         ┌────────────────────────────────────┐
+  Browser ──HTTPS──▶     │  Azure Static Web Apps (Free tier) │
+                         │                                    │
+                         │  ┌─ app/index.html (front-end)     │
+                         │  │                                 │
+                         │  └─ api/* (Azure Functions, Node 18)
+                         │       • GET    /api/entries         │
+                         │       • POST   /api/entries         │
+                         │       • DELETE /api/entries/{id}    │
+                         └───────────────┬────────────────────┘
+                                         │  ClientSecretCredential
+                                         │  (service principal)
+                                         ▼
+                              ┌──────────────────────┐
+                              │  Azure Table Storage  │
+                              │  (TimeEntries table)  │
+                              └──────────────────────┘
 ```
+
+**Authentication flow:** Entra ID (single-tenant OIDC) → SWA handles login → API receives authenticated requests. The API authenticates to Table Storage using a service principal with the "Storage Table Data Contributor" role.
 
 ## Prerequisites
 
@@ -107,6 +117,33 @@ All resources are free-tier eligible:
 - **Static Web Apps**: Free tier (100 GB bandwidth/month)
 - **Azure Table Storage**: ~$0.045/GB/month (pennies for demo usage)
 - **Azure Functions**: Managed by SWA, included in free tier
+
+> **Tip:** If you upgrade the SWA to Standard ($9/month) for features like custom domains or higher limits, managed identity becomes available for the SWA resource — but note that SWA managed functions **cannot** use the identity at runtime (the `IDENTITY_HEADER` is not exposed to function code). A linked Azure Functions app would be needed for full MI support.
+
+## Troubleshooting
+
+### "Too many redirects" after deploying
+The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.config.json`. Without it, unauthenticated requests to `/.auth/login/entra` match the `/*` rule (which requires `authenticated`), triggering a 302 back to `/.auth/login/entra` — an infinite loop. The deploy script handles this automatically.
+
+### "Could not load entries" or API returns 500
+| Cause | Fix |
+|-------|-----|
+| **Storage account has public access disabled** | Enable public network access. SWA managed functions don't support private endpoints on storage. |
+| **TimeEntries table doesn't exist** | Re-run `deploy.ps1` — it creates the table via ARM at deploy time. |
+| **Missing app settings** | Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, and `TABLE_STORAGE_URL` are set on the SWA. |
+| **Service principal secret expired** | Re-run `deploy.ps1` — it appends a fresh 1-year credential. |
+
+### Checking API logs
+```powershell
+# Stream live logs from the SWA
+az staticwebapp functions show --name timeentry-demo --resource-group rg-timeentry-demo
+```
+
+## Security Notes
+
+- **Service principal authentication**: The API uses `ClientSecretCredential` (tenant ID + client ID + secret) to access Table Storage. The deploy script stores these as SWA app settings (encrypted at rest).
+- **Why not managed identity?** SWA managed functions do not expose `IDENTITY_HEADER` or the MSI endpoint to user code. `DefaultAzureCredential` fails entirely. This is a [known platform limitation](https://learn.microsoft.com/en-us/azure/static-web-apps/apis-functions).
+- **Storage network access**: The storage account uses public network access. To fully lock it down, you'd need to replace SWA managed functions with a linked Azure Functions app that supports VNet integration and private endpoints.
 
 ## Cleanup
 
