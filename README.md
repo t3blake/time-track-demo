@@ -85,8 +85,8 @@ You also need:
 
 ```powershell
 # 1. Clone this repo
-git clone https://github.com/t3blake/time-entry-demo.git
-cd time-entry-demo
+git clone https://github.com/t3blake/time-track-demo.git
+cd time-track-demo
 
 # 2. Log in to Azure (if not already)
 az login
