@@ -199,6 +199,7 @@ if (-not $SkipAuth) {
             @{ route = "/.auth/login/github"; statusCode = 404 }
             @{ route = "/.auth/login/twitter"; statusCode = 404 }
             @{ route = "/.auth/login/aad"; statusCode = 404 }
+            @{ route = "/.auth/*"; allowedRoles = @("anonymous", "authenticated") }
             @{ route = "/*"; allowedRoles = @("authenticated") }
         )
         responseOverrides = @{
