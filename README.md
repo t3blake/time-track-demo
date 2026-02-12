@@ -141,11 +141,13 @@ time-entry-demo/
 
 | Resource | Tier | Approximate cost |
 |----------|------|------------------|
-| **Static Web Apps** | Free (default) | $0 — 100 GB bandwidth/month |
+| **Static Web Apps** | Standard | ~$9/month |
 | **Azure Table Storage** | Standard LRS | ~$0.045/GB/month (pennies for demo usage) |
 | **Azure Functions** | Managed by SWA | Included with SWA tier |
 
-> **Note:** The deploy script creates a **Free** tier SWA by default. If your organization requires features like custom domains, higher bandwidth, or you want to enable managed identity on the SWA resource, upgrade to **Standard** (~$9/month) in the Azure portal. Be aware that SWA managed functions still **cannot** use the managed identity at runtime — a linked Azure Functions app would be needed for full MI support.
+The deploy script creates a **Standard** tier SWA (~$9/month). Standard is required in environments with restrictive Entra ID policies and also enables features like custom domains and higher bandwidth limits.
+
+> **Note on managed identity:** Standard tier enables managed identity on the SWA resource, but SWA managed functions **cannot** use it at runtime (`IDENTITY_HEADER` is not exposed to function code). The API uses a service principal instead. A linked Azure Functions app would be needed for full MI support.
 
 ## Troubleshooting
 

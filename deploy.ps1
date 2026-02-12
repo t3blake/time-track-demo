@@ -190,13 +190,14 @@ Write-OK "Service principal '$apiAppName' ready with Storage Table Data Contribu
 
 # ── 4. Static Web App ───────────────────────────────────────────────────────
 
-Write-Step "4/8  Creating Static Web App..."
+Write-Step "4/8  Creating Static Web App (Standard tier)..."
 az staticwebapp create `
     --name $swaName `
     --resource-group $rgName `
     --location $Location `
+    --sku Standard `
     -o none 2>$null
-Write-OK "Static Web App '$swaName' created (Free tier)."
+Write-OK "Static Web App '$swaName' created (Standard tier)."
 
 $swaHostname = az staticwebapp show --name $swaName --resource-group $rgName --query "defaultHostname" -o tsv
 $swaUrl = "https://$swaHostname"
