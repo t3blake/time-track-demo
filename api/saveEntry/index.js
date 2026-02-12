@@ -1,13 +1,14 @@
 if (!globalThis.crypto) { globalThis.crypto = require("crypto").webcrypto; }
 
 const { TableClient, TableServiceClient } = require("@azure/data-tables");
-const { ClientSecretCredential } = require("@azure/identity");
+const { ClientCertificateCredential } = require("@azure/identity");
 
 function getCred() {
-  return new ClientSecretCredential(
+  const pem = Buffer.from(process.env.AZURE_CLIENT_CERTIFICATE, "base64").toString("utf8");
+  return new ClientCertificateCredential(
     process.env.AZURE_TENANT_ID,
     process.env.AZURE_CLIENT_ID,
-    process.env.AZURE_CLIENT_SECRET
+    { certificate: pem }
   );
 }
 

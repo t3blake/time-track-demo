@@ -159,8 +159,8 @@ The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.
 |-------|-----|
 | **Storage account has public access disabled** | Enable public network access. SWA managed functions don't support private endpoints on storage. |
 | **TimeEntries table doesn't exist** | Re-run `deploy.ps1` — it creates the table via ARM at deploy time. |
-| **Missing app settings** | Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, and `TABLE_STORAGE_URL` are set on the SWA. |
-| **Service principal secret expired** | Re-run `deploy.ps1` — it appends a fresh 1-year credential. |
+| **Missing app settings** | Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE`, and `TABLE_STORAGE_URL` are set on the SWA. |
+| **Service principal certificate expired** | Re-run `deploy.ps1` — it generates a fresh 1-year certificate. |
 
 ### Checking API logs
 ```powershell
@@ -170,7 +170,7 @@ az staticwebapp functions show --name timeentry-demo --resource-group rg-timeent
 
 ## Security Notes
 
-- **Service principal authentication**: The API uses `ClientSecretCredential` (tenant ID + client ID + secret) to access Table Storage. The deploy script stores these as SWA app settings (encrypted at rest).
+- **Certificate-based authentication**: The API uses `ClientCertificateCredential` with a self-signed certificate to access Table Storage. The deploy script generates a 1-year certificate, uploads the public key to the app registration, and stores the full PEM (base64-encoded) as the `AZURE_CLIENT_CERTIFICATE` app setting (encrypted at rest). No password credentials are used, which complies with enterprise Entra ID policies that block password-based app credentials.
 - **Why not managed identity?** SWA managed functions do not expose `IDENTITY_HEADER` or the MSI endpoint to user code. `DefaultAzureCredential` fails entirely. This is a [known platform limitation](https://learn.microsoft.com/en-us/azure/static-web-apps/apis-functions).
 - **Storage network access**: The storage account uses public network access. To fully lock it down, you'd need to replace SWA managed functions with a linked Azure Functions app that supports VNet integration and private endpoints.
 

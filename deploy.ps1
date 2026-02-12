@@ -360,14 +360,9 @@ Write-Step "7/8  Configuring app settings and installing dependencies..."
 $settings = @(
     "AZURE_TENANT_ID=$tenantId",
     "AZURE_CLIENT_ID=$apiAppId",
+    "AZURE_CLIENT_CERTIFICATE=$apiCertB64",
     "TABLE_STORAGE_URL=$storageUrl"
 )
-if ($apiSecret) {
-    $settings += "AZURE_CLIENT_SECRET=$apiSecret"
-} else {
-    Write-Warn "AZURE_CLIENT_SECRET not set — certificate credential was used."
-    Write-Warn "You must configure the API to use ClientCertificateCredential."
-}
 if (-not $SkipAuth) {
     $settings += "ENTRA_CLIENT_ID=$entraClientId"
     if ($entraSecret -and $entraSecret -ne "REPLACE_WITH_MANUAL_SECRET") {
