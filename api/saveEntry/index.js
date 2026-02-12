@@ -20,7 +20,7 @@ module.exports = async function (context, req) {
   try {
     const cred = getCred();
     const svc = new TableServiceClient(url, cred);
-    try { await svc.createTable("TimeEntries"); } catch (e) { if (e.statusCode !== 409) throw e; }
+    try { await svc.createTable("TimeEntries"); } catch (e) { if (e.statusCode !== 409 && e.statusCode !== 403) throw e; }
 
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const id = body.id || Date.now().toString(36) + Math.random().toString(36).slice(2, 6);

@@ -120,6 +120,13 @@ Write-OK "Storage account created."
 
 $storageUrl = "https://$storageName.table.core.windows.net"
 
+# Create TimeEntries table via ARM (data-plane createTable requires higher permissions)
+$subId = $account.id
+az rest --method PUT `
+    --url "/subscriptions/$subId/resourceGroups/$rgName/providers/Microsoft.Storage/storageAccounts/$storageName/tableServices/default/tables/TimeEntries?api-version=2023-01-01" `
+    --body '{}' -o none 2>$null
+Write-OK "TimeEntries table ensured."
+
 # ── 3. Service principal for Table Storage access ────────────────────────────
 Write-Step "Creating service principal '$apiAppName' for Table Storage..."
 $apiApp = az ad app create --display-name $apiAppName -o json | ConvertFrom-Json

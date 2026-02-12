@@ -20,7 +20,7 @@ module.exports = async function (context, req) {
   try {
     const cred = getCred();
     const svc = new TableServiceClient(url, cred);
-    try { await svc.createTable("TimeEntries"); } catch (e) { if (e.statusCode !== 409) throw e; }
+    try { await svc.createTable("TimeEntries"); } catch (e) { if (e.statusCode !== 409 && e.statusCode !== 403) throw e; }
 
     const client = new TableClient(url, "TimeEntries", cred);
     const entries = [];
