@@ -1,14 +1,10 @@
 if (!globalThis.crypto) { globalThis.crypto = require("crypto").webcrypto; }
 
 const { TableClient, TableServiceClient } = require("@azure/data-tables");
-const { ClientSecretCredential } = require("@azure/identity");
+const { DefaultAzureCredential } = require("@azure/identity");
 
 function getCred() {
-  return new ClientSecretCredential(
-    process.env.AZURE_TENANT_ID,
-    process.env.AZURE_CLIENT_ID,
-    process.env.AZURE_CLIENT_SECRET
-  );
+  return new DefaultAzureCredential();
 }
 
 module.exports = async function (context, req) {
