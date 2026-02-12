@@ -1,7 +1,7 @@
 # Time Entry Demo - Automated Deployment Script
 # Deploys a complete time entry web app to Azure Static Web Apps with:
 #   - Azure Table Storage for persistence
-#   - Built-in Azure AD authentication (tenant-validated at API level)
+#   - Entra ID authentication (custom OIDC provider, single-tenant)
 #   - Azure Functions API backend
 #   - Certificate-based service principal auth for Table Storage
 #
@@ -80,6 +80,7 @@ $swaName     = "$Prefix-demo"
 $storageName = ($Prefix -replace '[^a-z0-9]','') + "demostore"
 if ($storageName.Length -gt 24) { $storageName = $storageName.Substring(0, 24) }
 $apiAppName  = "$Prefix-table-api"
+$authAppName = "$Prefix-swa-auth"
 $scriptDir   = Get-ScriptDir
 
 Write-Step "Resource plan:"
@@ -88,21 +89,23 @@ Write-Host "  Static Web App:   $swaName"
 Write-Host "  Storage Account:  $storageName"
 Write-Host "  Location:         $Location"
 Write-Host "  API App:          $apiAppName"
-if (-not $SkipAuth) { Write-Host "  Auth:             Built-in Azure AD (tenant-validated)" }
+if (-not $SkipAuth) { Write-Host "  Auth App:         $authAppName" }
 Write-Host ""
 
 # ── Teardown ─────────────────────────────────────────────────────────────────
 
 if ($Teardown) {
     Write-Step "Tearing down all resources..."
-    Write-Warn "This will delete resource group '$rgName' and the API app registration."
+    Write-Warn "This will delete resource group '$rgName' and all Entra app registrations."
     $confirm = Read-Host "Type 'yes' to confirm"
     if ($confirm -ne 'yes') { Write-Host "Aborted."; exit 0 }
 
-    $apps = az ad app list --display-name $apiAppName --query "[].appId" -o tsv 2>$null
-    foreach ($appId in $apps) {
-        Write-Host "  Deleting app registration $appId ($apiAppName)..."
-        az ad app delete --id $appId 2>$null
+    foreach ($appDisplayName in @($apiAppName, $authAppName)) {
+        $apps = az ad app list --display-name $appDisplayName --query "[].appId" -o tsv 2>$null
+        foreach ($appId in $apps) {
+            Write-Host "  Deleting app registration $appId ($appDisplayName)..."
+            az ad app delete --id $appId 2>$null
+        }
     }
 
     $rgExists = az group exists --name $rgName -o tsv 2>$null
@@ -123,13 +126,13 @@ if ($Teardown) {
 
 # ── 1. Resource Group ────────────────────────────────────────────────────────
 
-Write-Step "1/7  Creating resource group..."
+Write-Step "1/8  Creating resource group..."
 az group create --name $rgName --location $Location -o none
 Write-OK "Resource group '$rgName' ready."
 
 # ── 2. Storage Account + Table ───────────────────────────────────────────────
 
-Write-Step "2/7  Creating storage account and table..."
+Write-Step "2/8  Creating storage account and table..."
 az storage account create `
     --name $storageName `
     --resource-group $rgName `
@@ -154,7 +157,7 @@ Write-OK "TimeEntries table created."
 
 # ── 3. Service Principal for Table Storage ───────────────────────────────────
 
-Write-Step "3/7  Creating service principal for Table Storage access..."
+Write-Step "3/8  Creating service principal for Table Storage access..."
 
 # Create (or find existing) app registration
 $existingApp = az ad app list --display-name $apiAppName --query "[0].appId" -o tsv 2>$null
@@ -215,7 +218,7 @@ Write-OK "Service principal '$apiAppName' ready with Storage Table Data Contribu
 
 # ── 4. Static Web App ───────────────────────────────────────────────────────
 
-Write-Step "4/7  Creating Static Web App (Standard tier)..."
+Write-Step "4/8  Creating Static Web App (Standard tier)..."
 az staticwebapp create `
     --name $swaName `
     --resource-group $rgName `
@@ -243,26 +246,122 @@ $swaHostname = az staticwebapp show --name $swaName --resource-group $rgName --q
 $swaUrl = "https://$swaHostname"
 Write-OK "URL: $swaUrl"
 
-# ── 5. Generate staticwebapp.config.json ─────────────────────────────────────
-
-Write-Step "5/7  Generating staticwebapp.config.json..."
+# ── 5. Entra ID Auth App Registration ────────────────────────────────────────
 
 if (-not $SkipAuth) {
-    # Uses SWA's built-in Azure AD provider (/.auth/login/aad).
-    # No app registration or client secret needed — Microsoft manages it.
-    # Tenant validation is enforced at the API level (checks x-ms-client-principal).
+    Write-Step "5/8  Creating Entra ID auth app registration..."
+
+    $existingAuthApp = az ad app list --display-name $authAppName --query "[0].{appId:appId, id:id}" -o json 2>$null | ConvertFrom-Json
+    if ($existingAuthApp) {
+        $authAppId     = $existingAuthApp.appId
+        $authObjectId  = $existingAuthApp.id
+        Write-Host "  Using existing auth app: $authAppId"
+    } else {
+        $callbackUrl = "$swaUrl/.auth/login/entra/callback"
+        $authApp = az ad app create `
+            --display-name $authAppName `
+            --sign-in-audience AzureADMyOrg `
+            --web-redirect-uris $callbackUrl `
+            -o json | ConvertFrom-Json
+        $authAppId    = $authApp.appId
+        $authObjectId = $authApp.id
+        Write-OK "Auth app created: $authAppId"
+    }
+
+    # Create client secret via Graph API.
+    # Using the Graph API directly bypasses Entra policies that block
+    # 'az ad app credential reset' in some enterprise tenants.
+    $secretBody = '{\"passwordCredential\":{\"displayName\":\"SWA Auth\",\"endDateTime\":\"' + (Get-Date).AddYears(1).ToString('yyyy-MM-ddTHH:mm:ssZ') + '\"}}'
+    $secretResult = az rest --method POST `
+        --url "https://graph.microsoft.com/v1.0/applications/$authObjectId/addPassword" `
+        --body $secretBody `
+        --headers "Content-Type=application/json" `
+        -o json | ConvertFrom-Json
+    $authSecret = $secretResult.secretText
+    Write-OK "Client secret created."
+
+    # Add openid + profile + email delegated permissions to Microsoft Graph
+    # and configure optional claims so the ID token includes email/upn.
+    $claimsBody = @"
+{
+  "requiredResourceAccess": [{
+    "resourceAppId": "00000003-0000-0000-c000-000000000000",
+    "resourceAccess": [
+      { "id": "37f7f235-527c-4136-accd-4a02d197296e", "type": "Scope" },
+      { "id": "14dad69e-099b-42c9-810b-d002981feec1", "type": "Scope" },
+      { "id": "64a6cdd6-aab1-4aaf-94b8-3cc8405e90d0", "type": "Scope" }
+    ]
+  }],
+  "optionalClaims": {
+    "idToken": [
+      { "name": "email", "essential": true },
+      { "name": "preferred_username", "essential": true },
+      { "name": "upn", "essential": true }
+    ]
+  },
+  "web": {
+    "implicitGrantSettings": { "enableIdTokenIssuance": true }
+  }
+}
+"@
+    $claimsBody | Set-Content "$scriptDir\_claims.json" -Encoding UTF8
+    az rest --method PATCH `
+        --url "https://graph.microsoft.com/v1.0/applications/$authObjectId" `
+        --body "@$scriptDir\_claims.json" `
+        --headers "Content-Type=application/json" `
+        -o none 2>$null
+    Remove-Item "$scriptDir\_claims.json" -ErrorAction SilentlyContinue
+    Write-OK "API permissions and optional claims configured."
+
+    # Grant admin consent
+    az ad app permission admin-consent --id $authAppId 2>$null
+    Write-OK "Admin consent granted."
+} else {
+    Write-Step "5/8  Skipping auth (--SkipAuth)..."
+}
+
+# ── 6. Generate staticwebapp.config.json ─────────────────────────────────────
+
+Write-Step "6/8  Generating staticwebapp.config.json..."
+
+if (-not $SkipAuth) {
+    # Uses a custom OpenID Connect provider named 'entra' backed by Entra ID.
+    # This gives us single-tenant auth with proper email claims.
+    # Tenant validation is also enforced at the API level (defense in depth).
     #
     # Route order matters! The /.auth/* route MUST appear before the /* catch-all
     # to prevent an infinite redirect loop.
     $swaConfig = @{
+        auth = @{
+            identityProviders = @{
+                customOpenIdConnectProviders = @{
+                    entra = @{
+                        registration = @{
+                            clientIdSettingName = "ENTRA_CLIENT_ID"
+                            clientCredential = @{
+                                clientSecretSettingName = "ENTRA_CLIENT_SECRET"
+                            }
+                            openIdConnectConfiguration = @{
+                                wellKnownOpenIdConfiguration = "https://login.microsoftonline.com/$tenantId/v2.0/.well-known/openid-configuration"
+                            }
+                        }
+                        login = @{
+                            nameClaimType = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"
+                            scopes = @("openid", "profile", "email")
+                        }
+                    }
+                }
+            }
+        }
         routes = @(
             @{ route = "/.auth/login/github";  statusCode = 404 }
             @{ route = "/.auth/login/twitter"; statusCode = 404 }
+            @{ route = "/.auth/login/aad";     statusCode = 404 }
             @{ route = "/.auth/*"; allowedRoles = @("anonymous", "authenticated") }
             @{ route = "/*";       allowedRoles = @("authenticated") }
         )
         responseOverrides = @{
-            "401" = @{ redirect = "/.auth/login/aad"; statusCode = 302 }
+            "401" = @{ redirect = "/.auth/login/entra"; statusCode = 302 }
         }
         navigationFallback = @{ rewrite = "/index.html"; exclude = @("/api/*") }
         platform = @{ apiRuntime = "node:18" }
@@ -279,7 +378,7 @@ Write-OK "Config written to app/staticwebapp.config.json"
 
 # ── 6. App Settings + API Dependencies ──────────────────────────────────────
 
-Write-Step "6/7  Configuring app settings and installing dependencies..."
+Write-Step "7/8  Configuring app settings and installing dependencies..."
 
 $settings = @(
     "AZURE_TENANT_ID=$tenantId",
@@ -287,6 +386,10 @@ $settings = @(
     "AZURE_CLIENT_CERTIFICATE=$apiCertB64",
     "TABLE_STORAGE_URL=$storageUrl"
 )
+if (-not $SkipAuth) {
+    $settings += "ENTRA_CLIENT_ID=$authAppId"
+    $settings += "ENTRA_CLIENT_SECRET=$authSecret"
+}
 
 az staticwebapp appsettings set `
     --name $swaName `
@@ -302,7 +405,7 @@ Write-OK "API dependencies installed."
 
 # ── 7. Deploy ───────────────────────────────────────────────────────────────
 
-Write-Step "7/7  Deploying application..."
+Write-Step "8/8  Deploying application..."
 
 $deployToken = az staticwebapp secrets list `
     --name $swaName `
@@ -370,7 +473,8 @@ Write-Host "  📦 Resource Group: $rgName"        -ForegroundColor White
 Write-Host "  📊 Storage:        $storageName"   -ForegroundColor White
 Write-Host "  🔑 API SP:         $apiAppName"    -ForegroundColor White
 if (-not $SkipAuth) {
-    Write-Host "  🔒 Auth:          Built-in Azure AD (tenant $tenantId)" -ForegroundColor White
+    Write-Host "  🔒 Auth:          Entra ID (custom OIDC, tenant $tenantId)" -ForegroundColor White
+    Write-Host "  🆔 Auth App:       $authAppName ($authAppId)" -ForegroundColor White
 }
 Write-Host ""
 Write-Host "  To tear down all resources:" -ForegroundColor DarkGray
