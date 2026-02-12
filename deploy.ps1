@@ -6,6 +6,7 @@
 #   - Certificate-based service principal auth for Table Storage
 #
 # Prerequisites:
+#   - Windows 10/11 (uses New-SelfSignedCertificate and the Windows cert store)
 #   - Azure CLI (az) installed and logged in
 #   - Node.js 18+ installed
 #   - PowerShell 7+
@@ -77,7 +78,7 @@ $tenantId = $account.tenantId
 
 $rgName      = "rg-$Prefix-demo"
 $swaName     = "$Prefix-demo"
-$storageName = ($Prefix -replace '[^a-z0-9]','') + "demostore"
+$storageName = (($Prefix -replace '[^a-z0-9]','') + "demostore").ToLower()
 if ($storageName.Length -gt 24) { $storageName = $storageName.Substring(0, 24) }
 $apiAppName  = "$Prefix-table-api"
 $authAppName = "$Prefix-swa-auth"
@@ -251,13 +252,20 @@ Write-OK "URL: $swaUrl"
 if (-not $SkipAuth) {
     Write-Step "5/8  Creating Entra ID auth app registration..."
 
+    $callbackUrl = "$swaUrl/.auth/login/entra/callback"
     $existingAuthApp = az ad app list --display-name $authAppName --query "[0].{appId:appId, id:id}" -o json 2>$null | ConvertFrom-Json
     if ($existingAuthApp) {
         $authAppId     = $existingAuthApp.appId
         $authObjectId  = $existingAuthApp.id
         Write-Host "  Using existing auth app: $authAppId"
+        # Update redirect URI in case the SWA hostname changed (e.g. after teardown + redeploy)
+        az rest --method PATCH `
+            --url "https://graph.microsoft.com/v1.0/applications/$authObjectId" `
+            --body "{`"web`":{`"redirectUris`":[`"$callbackUrl`"]}}" `
+            --headers "Content-Type=application/json" `
+            -o none 2>$null
+        Write-OK "Redirect URI updated to $callbackUrl"
     } else {
-        $callbackUrl = "$swaUrl/.auth/login/entra/callback"
         $authApp = az ad app create `
             --display-name $authAppName `
             --sign-in-audience AzureADMyOrg `
@@ -313,11 +321,14 @@ if (-not $SkipAuth) {
     Remove-Item "$scriptDir\_claims.json" -ErrorAction SilentlyContinue
     Write-OK "API permissions and optional claims configured."
 
+    # Ensure auth app has a service principal (required for admin consent)
+    az ad sp create --id $authAppId 2>$null | Out-Null
+
     # Grant admin consent
     az ad app permission admin-consent --id $authAppId 2>$null
     Write-OK "Admin consent granted."
 } else {
-    Write-Step "5/8  Skipping auth (--SkipAuth)..."
+    Write-Step "5/8  Skipping auth (-SkipAuth)..."
 }
 
 # ── 6. Generate staticwebapp.config.json ─────────────────────────────────────
@@ -459,6 +470,11 @@ if ($sscExe) {
 } else {
     Write-Err "No deployment tool found (StaticSitesClient or SWA CLI)."
     Write-Err "Install the SWA CLI manually:  npm install -g @azure/static-web-apps-cli"
+    exit 1
+}
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Deployment failed (exit code $LASTEXITCODE). Check the output above for details."
     exit 1
 }
 

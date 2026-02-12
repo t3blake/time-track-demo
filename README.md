@@ -72,6 +72,7 @@ flowchart TB
 
 | Tool | Minimum Version | Install |
 |------|----------------|---------|
+| **Windows** | 10 or 11 | Required (uses `New-SelfSignedCertificate` for cert generation) |
 | **PowerShell** | 7+ | Built into Windows 11, or [install](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell) |
 | **Azure CLI** | 2.50+ | `winget install Microsoft.AzureCLI` |
 | **Node.js** | 18+ | `winget install OpenJS.NodeJS.LTS` |
