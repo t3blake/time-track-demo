@@ -12,14 +12,14 @@
 #   - PowerShell 7+
 #
 # Usage:
-#   ./deploy.ps1                          # Deploy with defaults
+#   ./deploy.ps1                          # Deploy (prompts for prefix)
+#   ./deploy.ps1 -Prefix jsmith            # Deploy with a specific prefix
 #   ./deploy.ps1 -Location westus2        # Override region
-#   ./deploy.ps1 -Prefix myteam          # Custom resource prefix
 #   ./deploy.ps1 -SkipAuth               # Skip authentication (anonymous access)
 #   ./deploy.ps1 -Teardown               # Remove all resources
 
 param(
-    [string]$Prefix = "timeentry",
+    [string]$Prefix,
     [string]$Location = "eastus2",
     [switch]$SkipAuth,
     [switch]$Teardown
@@ -54,6 +54,24 @@ Write-Host ""
 Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
 Write-Host "║          Time Entry Demo - Deployment Script            ║" -ForegroundColor Cyan
 Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+# ── Prompt for prefix if not provided ────────────────────────────────────────
+
+if (-not $Prefix) {
+    $defaultPrefix = ($env:USERNAME -replace '[^a-zA-Z0-9]','').ToLower()
+    if ($defaultPrefix.Length -gt 12) { $defaultPrefix = $defaultPrefix.Substring(0, 12) }
+    Write-Host ""
+    Write-Host "  Each deployment needs a unique prefix for Azure resource names." -ForegroundColor White
+    Write-Host "  Use your alias, team name, or initials (lowercase, letters/numbers only)." -ForegroundColor DarkGray
+    Write-Host ""
+    $prefixInput = Read-Host "  Prefix [$defaultPrefix]"
+    $Prefix = if ($prefixInput) { $prefixInput.Trim().ToLower() } else { $defaultPrefix }
+    if (-not ($Prefix -match '^[a-z][a-z0-9]{1,11}$')) {
+        Write-Err "Prefix must be 2-12 lowercase letters/numbers, starting with a letter."
+        exit 1
+    }
+    Write-OK "Using prefix: $Prefix"
+}
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
 
@@ -324,9 +342,18 @@ if (-not $SkipAuth) {
     # Ensure auth app has a service principal (required for admin consent)
     az ad sp create --id $authAppId 2>$null | Out-Null
 
-    # Grant admin consent
-    az ad app permission admin-consent --id $authAppId 2>$null
-    Write-OK "Admin consent granted."
+    # Grant admin consent for the delegated permissions (openid, profile, email).
+    # This requires Global Admin, Cloud Application Admin, or Application Admin role.
+    # If it fails, the app will still work — users will see a one-time consent prompt.
+    $consentResult = az ad app permission admin-consent --id $authAppId 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-OK "Admin consent granted."
+    } else {
+        Write-Warn "Could not grant admin consent (you may lack the required Entra role)."
+        Write-Warn "Users will be prompted to consent on first login instead."
+        Write-Host "  To grant consent later, run:" -ForegroundColor DarkGray
+        Write-Host "    az ad app permission admin-consent --id $authAppId" -ForegroundColor DarkGray
+    }
 } else {
     Write-Step "5/8  Skipping auth (-SkipAuth)..."
 }
@@ -496,4 +523,7 @@ if (-not $SkipAuth) {
 Write-Host ""
 Write-Host "  To tear down all resources:" -ForegroundColor DarkGray
 Write-Host "    ./deploy.ps1 -Prefix $Prefix -Teardown" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  First time? Wait ~30 seconds for the API to cold-start," -ForegroundColor DarkGray
+Write-Host "  then open the URL above in your browser." -ForegroundColor DarkGray
 Write-Host ""

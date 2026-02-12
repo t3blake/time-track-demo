@@ -85,17 +85,17 @@ You also need:
 
 ```powershell
 # 1. Clone this repo
-git clone https://github.com/YOUR_USERNAME/time-entry-demo.git
+git clone https://github.com/t3blake/time-entry-demo.git
 cd time-entry-demo
 
 # 2. Log in to Azure (if not already)
 az login
 
-# 3. Deploy everything
+# 3. Deploy everything (you'll be prompted for a unique prefix)
 ./deploy.ps1
 ```
 
-That's it. The script will:
+The script prompts for a **prefix** (e.g. your alias) to generate unique Azure resource names. Then it will:
 1. Create a resource group, storage account, and Static Web App (Standard tier)
 2. Create a service principal with a certificate credential for Table Storage access
 3. Register an Entra ID auth app with client secret, API permissions, and optional claims
@@ -107,18 +107,17 @@ At the end it prints the URL to open in your browser.
 ## Options
 
 ```powershell
-# Deploy with a custom prefix (affects resource names)
-./deploy.ps1 -Prefix myteam
+# Skip the prefix prompt by passing it directly
+./deploy.ps1 -Prefix jsmith
 
 # Deploy to a different region
-./deploy.ps1 -Location westus2
+./deploy.ps1 -Prefix jsmith -Location westus2
 
 # Deploy without Entra ID auth (open to anyone)
-./deploy.ps1 -SkipAuth
+./deploy.ps1 -Prefix jsmith -SkipAuth
 
 # Tear down everything
-./deploy.ps1 -Teardown
-./deploy.ps1 -Prefix myteam -Teardown   # if you used a custom prefix
+./deploy.ps1 -Prefix jsmith -Teardown
 ```
 
 ## Project Structure
