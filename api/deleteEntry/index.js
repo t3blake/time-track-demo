@@ -12,19 +12,19 @@ function getCred() {
   );
 }
 
-function validateTenant(req) {
+// Validate that the caller authenticated through our custom OIDC provider.
+// The provider is configured with a single-tenant issuer URL, so only users
+// from the expected tenant can obtain a valid session.
+function validateAuth(req) {
   const header = req.headers["x-ms-client-principal"];
   if (!header) return false;
   const principal = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
-  const tenantClaim = (principal.claims || []).find(
-    c => c.typ === "http://schemas.microsoft.com/identity/claims/tenantid"
-  );
-  return tenantClaim && tenantClaim.val === process.env.AZURE_TENANT_ID;
+  return principal.identityProvider === "entra";
 }
 
 module.exports = async function (context, req) {
-  if (!validateTenant(req)) {
-    context.res = { status: 403, headers: { "Content-Type": "application/json" }, body: { error: "Access denied: tenant not allowed" } };
+  if (!validateAuth(req)) {
+    context.res = { status: 403, headers: { "Content-Type": "application/json" }, body: { error: "Access denied" } };
     return;
   }
   const url = process.env.TABLE_STORAGE_URL;

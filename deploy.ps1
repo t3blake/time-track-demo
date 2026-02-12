@@ -451,6 +451,7 @@ if ($sscExe) {
     Write-Host "  Using SWA CLI for deployment..."
     swa deploy "$scriptDir\app" `
         --api-location "$scriptDir\api" `
+        --api-language node --api-version 18 `
         --deployment-token $deployToken 2>&1 | ForEach-Object {
             if ($_ -match "Project deployed") { Write-OK $_ }
             else { Write-Host "  $_" }
