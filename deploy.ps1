@@ -17,8 +17,10 @@
 #   - PowerShell 7+
 #
 # Usage:
-#   ./deploy.ps1                          # Deploy (prompts for prefix)
+#   ./deploy.ps1                          # Deploy (prompts for prefix, RG, subnet)
 #   ./deploy.ps1 -Prefix jsmith            # Deploy with a specific prefix
+#   ./deploy.ps1 -ResourceGroup myRG       # Use an existing resource group
+#   ./deploy.ps1 -SubnetId /subscriptions/... # Use an existing Functions subnet
 #   ./deploy.ps1 -Location westus2        # Override region
 #   ./deploy.ps1 -SkipAuth               # Skip authentication (anonymous access)
 #   ./deploy.ps1 -Teardown               # Remove all resources
@@ -26,6 +28,8 @@
 param(
     [string]$Prefix,
     [string]$Location = "eastus2",
+    [string]$ResourceGroup,
+    [string]$SubnetId,
     [switch]$SkipAuth,
     [switch]$Teardown
 )
@@ -66,6 +70,34 @@ function Assert-Tool($cmd, $name, $wingetId) {
 function Get-ScriptDir {
     if ($PSScriptRoot) { return $PSScriptRoot }
     return Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+
+function Show-NumberedPicker {
+    <#
+    .SYNOPSIS
+        Displays a numbered list and prompts the user to pick one (or a "create new" option).
+        Returns the 0-based index of the selection, or -1 for "create new".
+    #>
+    param(
+        [string[]]$Items,
+        [string]$Prompt,
+        [string]$CreateNewLabel = "Create new"
+    )
+    Write-Host ""
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        Write-Host "    [$($i + 1)]  $($Items[$i])" -ForegroundColor White
+    }
+    Write-Host "    [N]  $CreateNewLabel" -ForegroundColor DarkGray
+    Write-Host ""
+    while ($true) {
+        $pick = Read-Host $Prompt
+        if ($pick -match '^[Nn]$') { return -1 }
+        $num = 0
+        if ([int]::TryParse($pick, [ref]$num) -and $num -ge 1 -and $num -le $Items.Count) {
+            return ($num - 1)
+        }
+        Write-Warn "Enter a number 1-$($Items.Count) or N for new."
+    }
 }
 
 # ── Banner ───────────────────────────────────────────────────────────────────
@@ -114,7 +146,6 @@ $tenantId = $account.tenantId
 
 # ── Resource names ───────────────────────────────────────────────────────────
 
-$rgName      = "rg-$Prefix-demo"
 $swaName     = "$Prefix-demo"
 $storageName = (($Prefix -replace '[^a-z0-9]','') + "demostore").ToLower()
 if ($storageName.Length -gt 24) { $storageName = $storageName.Substring(0, 24) }
@@ -124,22 +155,19 @@ $funcAppName = "$Prefix-demo-api"
 $vnetName    = "$Prefix-demo-vnet"
 $scriptDir   = Get-ScriptDir
 
-Write-Step "Resource plan:"
-Write-Host "  Resource Group:   $rgName"
-Write-Host "  Static Web App:   $swaName"
-Write-Host "  Functions App:    $funcAppName  (Flex Consumption)"
-Write-Host "  Storage Account:  $storageName  (private endpoint)"
-Write-Host "  Virtual Network:  $vnetName"
-Write-Host "  Location:         $Location"
-Write-Host "  API SP:           $apiAppName"
-if (-not $SkipAuth) { Write-Host "  Auth App:         $authAppName" }
-Write-Host ""
+# RG name may be overridden by the picker below; set a default for now
+$rgName = if ($ResourceGroup) { $ResourceGroup } else { "rg-$Prefix-demo" }
 
 # ── Teardown ─────────────────────────────────────────────────────────────────
 
 if ($Teardown) {
     Write-Step "Tearing down all resources..."
-    Write-Warn "This will delete resource group '$rgName' and all Entra app registrations."
+    if ($ResourceGroup) {
+        Write-Warn "You specified -ResourceGroup '$rgName'."
+        Write-Warn "Teardown will DELETE this entire resource group and everything in it."
+        Write-Warn "If this is a shared RG, consider manually deleting only the demo resources instead."
+    }
+    Write-Warn "This will delete Entra app registrations and the resource group '$rgName'."
     $confirm = Read-Host "Type 'yes' to confirm"
     if ($confirm -ne 'yes') { Write-Host "Aborted."; exit 0 }
 
@@ -169,13 +197,49 @@ if ($Teardown) {
 
 # ── 1. Resource Group ────────────────────────────────────────────────────────
 
-Write-Step "1/9  Creating resource group..."
-az group create --name $rgName --location $Location -o none
-Write-OK "Resource group '$rgName' ready."
+Write-Step "1/9  Resource group..."
 
-# ── 2. Virtual Network ──────────────────────────────────────────────────────
+$usingExistingRg = $false
 
-Write-Step "2/9  Creating virtual network and subnets..."
+if (-not $ResourceGroup) {
+    # List existing resource groups in the subscription and let the user pick
+    $rgList = az group list --query "[?provisioningState=='Succeeded'].name" -o tsv 2>$null
+    if ($rgList) {
+        $rgArray = @($rgList -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($rgArray.Count -gt 0) {
+            Write-Host "  Found $($rgArray.Count) existing resource group(s) in this subscription." -ForegroundColor White
+            Write-Host "  Pick one to deploy into, or create a new one." -ForegroundColor DarkGray
+            $rgIdx = Show-NumberedPicker -Items $rgArray -Prompt "  Resource group [1-$($rgArray.Count) or N]"
+            if ($rgIdx -ge 0) {
+                $rgName = $rgArray[$rgIdx]
+                $usingExistingRg = $true
+                # Inherit location from the existing RG
+                $rgLocation = az group show --name $rgName --query location -o tsv 2>$null
+                if ($rgLocation) { $Location = $rgLocation }
+                Write-OK "Using existing resource group '$rgName' ($Location)."
+            }
+        }
+    }
+} else {
+    # User passed -ResourceGroup on the command line
+    $rgExists = az group exists --name $ResourceGroup -o tsv 2>$null
+    if ($rgExists -eq 'true') {
+        $usingExistingRg = $true
+        $rgLocation = az group show --name $ResourceGroup --query location -o tsv 2>$null
+        if ($rgLocation) { $Location = $rgLocation }
+        Write-OK "Using existing resource group '$rgName' ($Location)."
+    }
+}
+
+if (-not $usingExistingRg) {
+    Write-Host "  Creating new resource group '$rgName' in $Location..."
+    az group create --name $rgName --location $Location -o none
+    Write-OK "Resource group '$rgName' created."
+}
+
+# ── 2. Virtual Network & Subnets ─────────────────────────────────────────────
+
+Write-Step "2/9  Virtual network and subnets..."
 
 # Pre-register the Microsoft.App resource provider (required for Flex Consumption
 # Functions). We do this early so it has time to complete before Step 5.
@@ -197,32 +261,195 @@ if ($rpState -ne 'Registered') {
 }
 Write-OK "Microsoft.App provider registered."
 
-az network vnet create `
-    --name $vnetName `
-    --resource-group $rgName `
-    --location $Location `
-    --address-prefix "10.0.0.0/16" `
-    -o none 2>$null
+# ── Subnet picker ──
+# The Functions app needs a subnet delegated to Microsoft.App/environments with
+# at least a /28 (Flex Consumption minimum).  We also need a companion subnet for
+# private endpoints (no delegation, any size).
 
-# Subnet for Functions VNet integration (delegated to Microsoft.App/environments
-# because Flex Consumption runs on Container Apps infrastructure).
-az network vnet subnet create `
-    --name "func-integration" `
-    --resource-group $rgName `
-    --vnet-name $vnetName `
-    --address-prefix "10.0.0.0/24" `
-    --delegations "Microsoft.App/environments" `
-    -o none 2>$null
+$usingExistingSubnet = $false
+$funcSubnetId        = $null     # resource ID — set by this section
+$peSubnetId          = $null     # resource ID for the PE subnet
+$selectedVnetName    = $null     # populated if user picks an existing subnet
+$selectedVnetRg      = $null
 
-# Subnet for private endpoints (no delegation needed)
-az network vnet subnet create `
-    --name "private-endpoints" `
-    --resource-group $rgName `
-    --vnet-name $vnetName `
-    --address-prefix "10.0.1.0/24" `
-    -o none 2>$null
+if (-not $SubnetId) {
+    # Discover subnets in the current subscription that already have the required
+    # delegation.  This lets users who have a centrally-managed VNet reuse it.
+    Write-Host "  Scanning for subnets delegated to Microsoft.App/environments..."
+    $allSubnets = az network vnet list --query "[].{vnet:name, rg:resourceGroup, subnets:subnets}" -o json 2>$null | ConvertFrom-Json
 
-Write-OK "VNet '$vnetName' ready with func-integration and private-endpoints subnets."
+    $candidates = @()
+    foreach ($vnet in $allSubnets) {
+        foreach ($sn in $vnet.subnets) {
+            $hasDelegation = $sn.delegations | Where-Object { $_.serviceName -eq 'Microsoft.App/environments' }
+            if ($hasDelegation) {
+                $candidates += [PSCustomObject]@{
+                    Label    = "$($vnet.vnet)/$($sn.name)  ($($sn.addressPrefix))  [$($vnet.rg)]"
+                    SubnetId = $sn.id
+                    VnetName = $vnet.vnet
+                    VnetRg   = $vnet.rg
+                    Prefix   = $sn.addressPrefix
+                    Name     = $sn.name
+                }
+            }
+        }
+    }
+
+    if ($candidates.Count -gt 0) {
+        Write-Host "  Found $($candidates.Count) compatible subnet(s)." -ForegroundColor White
+        Write-Host "  Pick one to use for Functions VNet integration, or create a new VNet." -ForegroundColor DarkGray
+        $labels = $candidates | ForEach-Object { $_.Label }
+        $snIdx = Show-NumberedPicker -Items $labels -Prompt "  Subnet [1-$($candidates.Count) or N]"
+        if ($snIdx -ge 0) {
+            $chosen = $candidates[$snIdx]
+            $funcSubnetId       = $chosen.SubnetId
+            $selectedVnetName   = $chosen.VnetName
+            $selectedVnetRg     = $chosen.VnetRg
+            $usingExistingSubnet = $true
+        }
+    }
+} else {
+    # User passed -SubnetId on the command line — validate it
+    $funcSubnetId = $SubnetId
+    # Parse VNet name and RG from the resource ID
+    if ($SubnetId -match '/resourceGroups/([^/]+)/providers/Microsoft.Network/virtualNetworks/([^/]+)/subnets/') {
+        $selectedVnetRg   = $Matches[1]
+        $selectedVnetName = $Matches[2]
+    }
+    $usingExistingSubnet = $true
+}
+
+# ── Validate an existing subnet ──
+if ($usingExistingSubnet -and $funcSubnetId) {
+    Write-Host "  Validating subnet..." -ForegroundColor White
+    $snInfo = az network vnet subnet show --ids $funcSubnetId -o json 2>$null | ConvertFrom-Json
+    if (-not $snInfo) {
+        Write-Err "Could not find subnet: $funcSubnetId"
+        exit 1
+    }
+
+    # Check 1 — Delegation
+    $hasDelegation = $snInfo.delegations | Where-Object { $_.serviceName -eq 'Microsoft.App/environments' }
+    if (-not $hasDelegation) {
+        Write-Err "Subnet must be delegated to Microsoft.App/environments (Flex Consumption requirement)."
+        Write-Err "Current delegations: $(($snInfo.delegations | ForEach-Object { $_.serviceName }) -join ', ')"
+        exit 1
+    }
+    Write-OK "Delegation: Microsoft.App/environments"
+
+    # Check 2 — Minimum size /28 (16 addresses)
+    $cidr = [int]($snInfo.addressPrefix -split '/')[1]
+    if ($cidr -gt 28) {
+        Write-Err "Subnet CIDR is /$cidr — Flex Consumption requires at least /28 (16 addresses)."
+        exit 1
+    }
+    Write-OK "CIDR: $($snInfo.addressPrefix) (meets /28 minimum)"
+
+    # Check 3 — Warn if subnet already has connected devices
+    if ($snInfo.ipConfigurations -and $snInfo.ipConfigurations.Count -gt 0) {
+        Write-Warn "Subnet has $($snInfo.ipConfigurations.Count) existing IP configuration(s) — this is OK for shared subnets."
+    }
+
+    Write-OK "Using existing subnet: $($snInfo.name) ($($snInfo.addressPrefix))"
+
+    # Look for a companion "private-endpoints" subnet in the same VNet,
+    # or create one if it doesn't exist.
+    $peSubnet = az network vnet subnet show `
+        --name "private-endpoints" `
+        --resource-group $selectedVnetRg `
+        --vnet-name $selectedVnetName `
+        --query id -o tsv 2>$null
+    if ($peSubnet) {
+        $peSubnetId = $peSubnet
+        Write-OK "Private-endpoints subnet found in same VNet."
+    } else {
+        Write-Host "  Creating 'private-endpoints' subnet in $selectedVnetName..."
+        # Find a non-overlapping /24 in the VNet
+        $vnetPrefixes = az network vnet show --name $selectedVnetName --resource-group $selectedVnetRg `
+            --query "addressSpace.addressPrefixes" -o json 2>$null | ConvertFrom-Json
+        # Use 10.0.1.0/24 as default; the user's VNet may have different addressing
+        $pePrefix = "10.0.1.0/24"
+        az network vnet subnet create `
+            --name "private-endpoints" `
+            --resource-group $selectedVnetRg `
+            --vnet-name $selectedVnetName `
+            --address-prefix $pePrefix `
+            -o none 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Failed to create private-endpoints subnet ($pePrefix). You may need to choose a non-overlapping CIDR."
+            exit 1
+        }
+        $peSubnetId = az network vnet subnet show `
+            --name "private-endpoints" `
+            --resource-group $selectedVnetRg `
+            --vnet-name $selectedVnetName `
+            --query id -o tsv
+        Write-OK "Created private-endpoints subnet ($pePrefix)."
+    }
+    $vnetName = $selectedVnetName
+}
+
+# ── Create new VNet + subnets (if not using an existing one) ──
+if (-not $usingExistingSubnet) {
+    az network vnet create `
+        --name $vnetName `
+        --resource-group $rgName `
+        --location $Location `
+        --address-prefix "10.0.0.0/16" `
+        -o none 2>$null
+
+    # Subnet for Functions VNet integration (delegated to Microsoft.App/environments
+    # because Flex Consumption runs on Container Apps infrastructure).
+    az network vnet subnet create `
+        --name "func-integration" `
+        --resource-group $rgName `
+        --vnet-name $vnetName `
+        --address-prefix "10.0.0.0/24" `
+        --delegations "Microsoft.App/environments" `
+        -o none 2>$null
+
+    # Subnet for private endpoints (no delegation needed)
+    az network vnet subnet create `
+        --name "private-endpoints" `
+        --resource-group $rgName `
+        --vnet-name $vnetName `
+        --address-prefix "10.0.1.0/24" `
+        -o none 2>$null
+
+    Write-OK "VNet '$vnetName' created with func-integration and private-endpoints subnets."
+
+    $selectedVnetRg = $rgName
+}
+
+# Resolve subnet resource IDs for later steps (if not already set)
+if (-not $funcSubnetId) {
+    $funcSubnetId = az network vnet subnet show `
+        --name "func-integration" `
+        --resource-group $rgName `
+        --vnet-name $vnetName `
+        --query id -o tsv
+}
+if (-not $peSubnetId) {
+    $peSubnetId = az network vnet subnet show `
+        --name "private-endpoints" `
+        --resource-group ($selectedVnetRg ?? $rgName) `
+        --vnet-name $vnetName `
+        --query id -o tsv
+}
+
+# Resolve VNet RG (may differ from deployment RG when using existing subnets)
+$vnetRg = if ($selectedVnetRg) { $selectedVnetRg } else { $rgName }
+
+Write-Step "Resource plan:"
+Write-Host "  Resource Group:   $rgName$(if ($usingExistingRg) {' (existing)'})"
+Write-Host "  VNet / Subnet:    $vnetName$(if ($usingExistingSubnet) {' (existing)'})"
+Write-Host "  Static Web App:   $swaName"
+Write-Host "  Functions App:    $funcAppName  (Flex Consumption)"
+Write-Host "  Storage Account:  $storageName  (private endpoint)"
+Write-Host "  Location:         $Location"
+Write-Host "  API SP:           $apiAppName"
+if (-not $SkipAuth) { Write-Host "  Auth App:         $authAppName" }
+Write-Host ""
 
 # ── 3. Storage Account + Private Endpoints + Table ───────────────────────────
 
@@ -241,11 +468,7 @@ Write-OK "Storage account '$storageName' created."
 $storageId = az storage account show --name $storageName --resource-group $rgName --query id -o tsv
 
 # Private endpoints for blob (Functions deployment storage) and table (app data)
-$peSubnetId = az network vnet subnet show `
-    --name "private-endpoints" `
-    --resource-group $rgName `
-    --vnet-name $vnetName `
-    --query id -o tsv
+# $peSubnetId and $vnetName are already resolved from the subnet picker in Step 2.
 
 foreach ($subResource in @("blob", "table", "queue")) {
     $peName = "$storageName-$subResource-pe"
@@ -254,8 +477,7 @@ foreach ($subResource in @("blob", "table", "queue")) {
         --name $peName `
         --resource-group $rgName `
         --location $Location `
-        --vnet-name $vnetName `
-        --subnet "private-endpoints" `
+        --subnet $peSubnetId `
         --private-connection-resource-id $storageId `
         --group-id $subResource `
         --connection-name "$storageName-$subResource" `
@@ -269,11 +491,12 @@ foreach ($subResource in @("blob", "table", "queue")) {
         -o none 2>$null
 
     # Link DNS zone to our VNet so VNet-integrated apps resolve private IPs
+    $vnetResourceId = az network vnet show --name $vnetName --resource-group $vnetRg --query id -o tsv 2>$null
     az network private-dns zone vnet-link create `
         --name "$vnetName-$subResource-link" `
         --resource-group $rgName `
         --zone-name $dnsZone `
-        --virtual-network $vnetName `
+        --virtual-network $vnetResourceId `
         --registration-enabled false `
         -o none 2>$null
 
@@ -369,21 +592,11 @@ Write-OK "Service principal '$apiAppName' ready with Storage Table Data Contribu
 Write-Step "5/9  Creating Functions app (Flex Consumption with VNet integration)..."
 
 $storageUrl = "https://$storageName.table.core.windows.net"
-$funcSubnetId = az network vnet subnet show `
-    --name "func-integration" `
-    --resource-group $rgName `
-    --vnet-name $vnetName `
-    --query id -o tsv
 
+# $funcSubnetId is already resolved from the subnet picker in Step 2.
 # Create the Flex Consumption function app with VNet integration from the start.
 # WEBSITE_CONTENTOVERVNET routes deployment storage traffic through the VNet,
 # which is required because the storage account has public access disabled.
-# Both --vnet and --subnet are required for Flex Consumption networking.
-$vnetId = az network vnet show `
-    --name $vnetName `
-    --resource-group $rgName `
-    --query id -o tsv
-
 az functionapp create `
     --name $funcAppName `
     --resource-group $rgName `
@@ -392,7 +605,6 @@ az functionapp create `
     --runtime node `
     --runtime-version 20 `
     --functions-version 4 `
-    --vnet $vnetId `
     --subnet $funcSubnetId `
     -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
 
