@@ -741,11 +741,86 @@ if (-not $funcCheck) {
 
 Write-OK "Functions app '$funcAppName' created with VNet integration."
 
+# Enable system-assigned managed identity for identity-based storage connections.
+# This is required because enterprise policy enforces allowSharedKeyAccess=false
+# on storage accounts, so the Functions runtime cannot use connection strings.
+Write-Host "  Enabling managed identity..."
+$miResult = az functionapp identity assign `
+    --name $funcAppName `
+    --resource-group $rgName `
+    --identities [system] `
+    -o json 2>&1
+$miPrincipalId = ($miResult | ConvertFrom-Json).principalId
+Write-OK "Managed identity enabled (principal: $miPrincipalId)."
+
+# Assign storage RBAC roles to the managed identity.
+# The Functions runtime needs Blob/Queue access for internal operations
+# (triggers, deployment, host keys), and Table access for the app data.
+Write-Host "  Assigning storage RBAC roles to managed identity..."
+foreach ($role in @("Storage Blob Data Owner", "Storage Queue Data Contributor", "Storage Table Data Contributor")) {
+    az role assignment create `
+        --assignee-object-id $miPrincipalId `
+        --assignee-principal-type ServicePrincipal `
+        --role $role `
+        --scope $storageId `
+        -o none 2>$null
+}
+Write-OK "Storage RBAC roles assigned."
+
+# Switch from key-based to identity-based storage connections.
+# az functionapp create sets AzureWebJobsStorage and DEPLOYMENT_STORAGE_CONNECTION_STRING
+# using connection strings by default, but key auth is disabled on the storage account.
+Write-Host "  Switching to identity-based storage connections..."
+az functionapp config appsettings delete `
+    --name $funcAppName `
+    --resource-group $rgName `
+    --setting-names AzureWebJobsStorage DEPLOYMENT_STORAGE_CONNECTION_STRING `
+    -o none 2>$null
+
+# Update the deployment storage to use SystemAssignedIdentity auth
+$funcId = az functionapp show --name $funcAppName --resource-group $rgName --query id -o tsv
+$deployContainer = az rest --method get --uri "${funcId}?api-version=2023-12-01" `
+    --query "properties.functionAppConfig.deployment.storage.value" -o tsv
+$patchFile = "$scriptDir\_deploypatch.json"
+@{
+    properties = @{
+        functionAppConfig = @{
+            deployment = @{
+                storage = @{
+                    type = "blobContainer"
+                    value = $deployContainer
+                    authentication = @{ type = "SystemAssignedIdentity" }
+                }
+            }
+            runtime = @{ name = "node"; version = "20" }
+            scaleAndConcurrency = @{ instanceMemoryMB = 2048; maximumInstanceCount = 100 }
+        }
+    }
+} | ConvertTo-Json -Depth 10 | Out-File $patchFile -Encoding utf8
+az rest --method patch --uri "${funcId}?api-version=2023-12-01" --body "@$patchFile" -o none 2>$null
+Remove-Item $patchFile -ErrorAction SilentlyContinue
+Write-OK "Deployment storage switched to managed identity auth."
+
+# Wait for RBAC propagation (identity-based storage requires this)
+Write-Host "  Waiting for RBAC propagation (up to 5 min)..."
+$rbacReady = $false
+for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep 10
+    # Check if the deployment container is accessible
+    $depStatus = az rest --method get --uri "${funcId}?api-version=2023-12-01" `
+        --query "properties.functionAppConfig.deployment.storage.authentication.type" -o tsv 2>$null
+    if ($depStatus -eq "systemassignedidentity") { $rbacReady = $true; break }
+}
+if (-not $rbacReady) {
+    Write-Warn "RBAC may still be propagating. Deployment will retry if needed."
+}
+
 # Configure app settings for the API
 az functionapp config appsettings set `
     --name $funcAppName `
     --resource-group $rgName `
     --settings `
+        "AzureWebJobsStorage__accountName=$storageName" `
         "WEBSITE_CONTENTOVERVNET=1" `
         "AZURE_TENANT_ID=$tenantId" `
         "AZURE_CLIENT_ID=$apiAppId" `
@@ -765,13 +840,31 @@ $zipPath = "$scriptDir\_api-deploy.zip"
 if (Test-Path $zipPath) { Remove-Item $zipPath }
 Compress-Archive -Path "$scriptDir\api\*" -DestinationPath $zipPath -Force
 
-az functionapp deployment source config-zip `
-    --name $funcAppName `
-    --resource-group $rgName `
-    --src $zipPath `
-    -o none 2>$null
+# Retry deployment up to 3 times (RBAC propagation can cause initial 403s)
+$deploySuccess = $false
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+    Write-Host "  Deploy attempt $attempt/3..."
+    $deployResult = az functionapp deployment source config-zip `
+        --name $funcAppName `
+        --resource-group $rgName `
+        --src $zipPath `
+        -o json 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $deploySuccess = $true
+        break
+    }
+    if ($attempt -lt 3) {
+        Write-Warn "Deployment attempt $attempt failed (RBAC may still be propagating). Retrying in 60s..."
+        Start-Sleep 60
+    }
+}
 
 Remove-Item $zipPath -ErrorAction SilentlyContinue
+if (-not $deploySuccess) {
+    Write-Err "API deployment failed after 3 attempts. Run the script again to retry."
+    Write-Host "  Last error: $deployResult" -ForegroundColor DarkGray
+    exit 1
+}
 Write-OK "API code deployed to Functions app."
 
 # ── 6. Static Web App ───────────────────────────────────────────────────────

@@ -13,6 +13,11 @@ _api-deploy.zip
 _claims.json
 _link.json
 _redirect.json
+_deploypatch.json
+_deploy_storage_patch.json
+
+# Diagnostic temp files (created during troubleshooting)
+_*.txt
 
 # Environment / secret files — never commit these
 .env
