@@ -163,7 +163,7 @@ The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.
 ### "Could not load entries" or API returns 500
 | Cause | Fix |
 |-------|-----|
-| **Storage account has public access disabled** | Enable public network access. SWA managed functions don't support private endpoints on storage. |
+| **Storage account has public access disabled** | The deploy script automatically enables public network access and verifies it. If Azure Policy blocks this, ask your admin for a policy exemption — SWA managed functions cannot use private endpoints. |
 | **TimeEntries table doesn't exist** | Re-run `deploy.ps1` — it creates the table via ARM at deploy time. |
 | **Missing app settings** | Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE`, `TABLE_STORAGE_URL`, `ENTRA_CLIENT_ID`, and `ENTRA_CLIENT_SECRET` are set on the SWA. |
 | **Service principal certificate expired** | Re-run `deploy.ps1` — it generates a fresh 1-year certificate. |

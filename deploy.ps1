@@ -1,7 +1,7 @@
 # Time Entry Demo - Automated Deployment Script
 # Deploys a complete time entry web app to Azure Static Web Apps with:
 #   - Azure Table Storage for persistence
-#   - Entra ID authentication (custom OIDC provider, single-tenant)
+#   - Entra ID authentication (adaptive: custom OIDC or built-in AAD)
 #   - Azure Functions API backend
 #   - Certificate-based service principal auth for Table Storage
 #
@@ -167,15 +167,70 @@ Write-OK "Resource group '$rgName' ready."
 # ── 2. Storage Account + Table ───────────────────────────────────────────────
 
 Write-Step "2/8  Creating storage account and table..."
-az storage account create `
+
+# SWA managed functions connect to storage over the public internet.
+# We explicitly request public network access because some enterprise
+# subscriptions have Azure Policies that restrict or disable it by default.
+$createOut = az storage account create `
     --name $storageName `
     --resource-group $rgName `
     --location $Location `
     --sku Standard_LRS `
     --min-tls-version TLS1_2 `
     --allow-blob-public-access false `
-    -o none
+    --public-network-access Enabled `
+    -o none 2>&1
+
+if ($LASTEXITCODE -ne 0) {
+    if ("$createOut" -match "RequestDisallowedByPolicy") {
+        Write-Warn "Azure Policy blocked storage creation with public network access."
+        Write-Host "  Retrying without the explicit flag..."
+        az storage account create `
+            --name $storageName `
+            --resource-group $rgName `
+            --location $Location `
+            --sku Standard_LRS `
+            --min-tls-version TLS1_2 `
+            --allow-blob-public-access false `
+            -o none
+    } else {
+        Write-Err "Failed to create storage account."
+        Write-Host "  $createOut" -ForegroundColor Red
+        exit 1
+    }
+}
 Write-OK "Storage account '$storageName' created."
+
+# Verify public network access is enabled — Azure Policy may have overridden
+# the requested setting (Modify or DeployIfNotExists policy effects).
+$netCfg = az storage account show --name $storageName --resource-group $rgName `
+    --query "{publicAccess:publicNetworkAccess, defaultAction:networkRuleSet.defaultAction}" `
+    -o json 2>$null | ConvertFrom-Json
+
+if ($netCfg.publicAccess -ne "Enabled" -or $netCfg.defaultAction -ne "Allow") {
+    Write-Warn "Storage network access restricted (public=$($netCfg.publicAccess), firewall=$($netCfg.defaultAction))."
+    Write-Host "  SWA managed functions require public access — attempting to enable..."
+    az storage account update --name $storageName --resource-group $rgName `
+        --public-network-access Enabled --default-action Allow -o none 2>&1 | Out-Null
+
+    $netCfg = az storage account show --name $storageName --resource-group $rgName `
+        --query "{publicAccess:publicNetworkAccess, defaultAction:networkRuleSet.defaultAction}" `
+        -o json 2>$null | ConvertFrom-Json
+
+    if ($netCfg.publicAccess -ne "Enabled" -or $netCfg.defaultAction -ne "Allow") {
+        Write-Err "Cannot enable public network access on the storage account."
+        Write-Err "An Azure Policy is enforcing network restrictions."
+        Write-Host ""
+        Write-Host "  SWA managed functions connect to storage over the public internet." -ForegroundColor Yellow
+        Write-Host "  They do not support VNet integration or private endpoints." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Ask your Azure admin to create a policy exemption for" -ForegroundColor White
+        Write-Host "  resource group '$rgName' or storage account '$storageName'." -ForegroundColor White
+        Write-Host ""
+        exit 1
+    }
+    Write-OK "Public network access enabled on storage account."
+}
 
 $storageUrl = "https://$storageName.table.core.windows.net"
 
@@ -458,6 +513,7 @@ if (-not $SkipAuth) {
             routes = @(
                 @{ route = "/.auth/login/github";  statusCode = 404 }
                 @{ route = "/.auth/login/twitter"; statusCode = 404 }
+                @{ route = "/.auth/login/entra";   statusCode = 404 }
                 @{ route = "/.auth/*"; allowedRoles = @("anonymous", "authenticated") }
                 @{ route = "/*";       allowedRoles = @("authenticated") }
             )
