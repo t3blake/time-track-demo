@@ -1,9 +1,14 @@
 # Time Entry Demo - Automated Deployment Script
 # Deploys a complete time entry web app to Azure Static Web Apps with:
-#   - Azure Table Storage for persistence
+#   - Azure Table Storage for persistence (private endpoint, no public access)
 #   - Entra ID authentication (built-in AAD provider, single-tenant)
-#   - Azure Functions API backend
+#   - Linked Azure Functions API (Flex Consumption, VNet-integrated)
 #   - Certificate-based service principal auth for Table Storage
+#
+# Network architecture:
+#   SWA → Linked Backend → Functions App → VNet → Private Endpoint → Storage
+#   Storage has public network access DISABLED. The Functions app reaches it
+#   through VNet integration and a private endpoint + private DNS zone.
 #
 # Prerequisites:
 #   - Windows 10/11 (uses New-SelfSignedCertificate and the Windows cert store)
@@ -115,14 +120,18 @@ $storageName = (($Prefix -replace '[^a-z0-9]','') + "demostore").ToLower()
 if ($storageName.Length -gt 24) { $storageName = $storageName.Substring(0, 24) }
 $apiAppName  = "$Prefix-table-api"
 $authAppName = "$Prefix-swa-auth"
+$funcAppName = "$Prefix-demo-api"
+$vnetName    = "$Prefix-demo-vnet"
 $scriptDir   = Get-ScriptDir
 
 Write-Step "Resource plan:"
 Write-Host "  Resource Group:   $rgName"
 Write-Host "  Static Web App:   $swaName"
-Write-Host "  Storage Account:  $storageName"
+Write-Host "  Functions App:    $funcAppName  (Flex Consumption)"
+Write-Host "  Storage Account:  $storageName  (private endpoint)"
+Write-Host "  Virtual Network:  $vnetName"
 Write-Host "  Location:         $Location"
-Write-Host "  API App:          $apiAppName"
+Write-Host "  API SP:           $apiAppName"
 if (-not $SkipAuth) { Write-Host "  Auth App:         $authAppName" }
 Write-Host ""
 
@@ -160,93 +169,144 @@ if ($Teardown) {
 
 # ── 1. Resource Group ────────────────────────────────────────────────────────
 
-Write-Step "1/8  Creating resource group..."
+Write-Step "1/9  Creating resource group..."
 az group create --name $rgName --location $Location -o none
 Write-OK "Resource group '$rgName' ready."
 
-# ── 2. Storage Account + Table ───────────────────────────────────────────────
+# ── 2. Virtual Network ──────────────────────────────────────────────────────
 
-Write-Step "2/8  Creating storage account and table..."
+Write-Step "2/9  Creating virtual network and subnets..."
 
-# SWA managed functions connect to storage over the public internet.
-# We explicitly request public network access because some enterprise
-# subscriptions have Azure Policies that restrict or disable it by default.
-$createOut = az storage account create `
+# Pre-register the Microsoft.App resource provider (required for Flex Consumption
+# Functions). We do this early so it has time to complete before Step 5.
+Write-Host "  Registering Microsoft.App resource provider (if needed)..."
+$rpState = az provider show --namespace Microsoft.App --query registrationState -o tsv 2>$null
+if ($rpState -ne 'Registered') {
+    az provider register --namespace Microsoft.App -o none 2>$null
+    $attempt = 0
+    do {
+        Start-Sleep 10
+        $rpState = az provider show --namespace Microsoft.App --query registrationState -o tsv 2>$null
+        $attempt++
+        if ($attempt % 6 -eq 0) { Write-Host "    Still waiting for Microsoft.App registration ($rpState)..." }
+    } while ($rpState -ne 'Registered' -and $attempt -lt 60)
+    if ($rpState -ne 'Registered') {
+        Write-Err "Microsoft.App provider did not register after 10 minutes. State: $rpState"
+        exit 1
+    }
+}
+Write-OK "Microsoft.App provider registered."
+
+az network vnet create `
+    --name $vnetName `
+    --resource-group $rgName `
+    --location $Location `
+    --address-prefix "10.0.0.0/16" `
+    -o none 2>$null
+
+# Subnet for Functions VNet integration (delegated to Microsoft.App/environments
+# because Flex Consumption runs on Container Apps infrastructure).
+az network vnet subnet create `
+    --name "func-integration" `
+    --resource-group $rgName `
+    --vnet-name $vnetName `
+    --address-prefix "10.0.0.0/24" `
+    --delegations "Microsoft.App/environments" `
+    -o none 2>$null
+
+# Subnet for private endpoints (no delegation needed)
+az network vnet subnet create `
+    --name "private-endpoints" `
+    --resource-group $rgName `
+    --vnet-name $vnetName `
+    --address-prefix "10.0.1.0/24" `
+    -o none 2>$null
+
+Write-OK "VNet '$vnetName' ready with func-integration and private-endpoints subnets."
+
+# ── 3. Storage Account + Private Endpoints + Table ───────────────────────────
+
+Write-Step "3/9  Creating storage account with private endpoints..."
+
+az storage account create `
     --name $storageName `
     --resource-group $rgName `
     --location $Location `
     --sku Standard_LRS `
     --min-tls-version TLS1_2 `
     --allow-blob-public-access false `
-    --public-network-access Enabled `
-    -o none 2>&1
-
-if ($LASTEXITCODE -ne 0) {
-    if ("$createOut" -match "RequestDisallowedByPolicy") {
-        Write-Warn "Azure Policy blocked storage creation with public network access."
-        Write-Host "  Retrying without the explicit flag..."
-        az storage account create `
-            --name $storageName `
-            --resource-group $rgName `
-            --location $Location `
-            --sku Standard_LRS `
-            --min-tls-version TLS1_2 `
-            --allow-blob-public-access false `
-            -o none
-    } else {
-        Write-Err "Failed to create storage account."
-        Write-Host "  $createOut" -ForegroundColor Red
-        exit 1
-    }
-}
+    -o none
 Write-OK "Storage account '$storageName' created."
 
-# Verify public network access is enabled — Azure Policy may have overridden
-# the requested setting (Modify or DeployIfNotExists policy effects).
-$netCfg = az storage account show --name $storageName --resource-group $rgName `
-    --query "{publicAccess:publicNetworkAccess, defaultAction:networkRuleSet.defaultAction}" `
-    -o json 2>$null | ConvertFrom-Json
+$storageId = az storage account show --name $storageName --resource-group $rgName --query id -o tsv
 
-if ($netCfg.publicAccess -ne "Enabled" -or $netCfg.defaultAction -ne "Allow") {
-    Write-Warn "Storage network access restricted (public=$($netCfg.publicAccess), firewall=$($netCfg.defaultAction))."
-    Write-Host "  SWA managed functions require public access — attempting to enable..."
-    az storage account update --name $storageName --resource-group $rgName `
-        --public-network-access Enabled --default-action Allow -o none 2>&1 | Out-Null
+# Private endpoints for blob (Functions deployment storage) and table (app data)
+$peSubnetId = az network vnet subnet show `
+    --name "private-endpoints" `
+    --resource-group $rgName `
+    --vnet-name $vnetName `
+    --query id -o tsv
 
-    $netCfg = az storage account show --name $storageName --resource-group $rgName `
-        --query "{publicAccess:publicNetworkAccess, defaultAction:networkRuleSet.defaultAction}" `
-        -o json 2>$null | ConvertFrom-Json
+foreach ($subResource in @("blob", "table", "queue")) {
+    $peName = "$storageName-$subResource-pe"
+    Write-Host "  Creating private endpoint: $peName ($subResource)..."
+    az network private-endpoint create `
+        --name $peName `
+        --resource-group $rgName `
+        --location $Location `
+        --vnet-name $vnetName `
+        --subnet "private-endpoints" `
+        --private-connection-resource-id $storageId `
+        --group-id $subResource `
+        --connection-name "$storageName-$subResource" `
+        -o none 2>$null
 
-    if ($netCfg.publicAccess -ne "Enabled" -or $netCfg.defaultAction -ne "Allow") {
-        Write-Err "Cannot enable public network access on the storage account."
-        Write-Err "An Azure Policy is enforcing network restrictions."
-        Write-Host ""
-        Write-Host "  SWA managed functions connect to storage over the public internet." -ForegroundColor Yellow
-        Write-Host "  They do not support VNet integration or private endpoints." -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "  Ask your Azure admin to create a policy exemption for" -ForegroundColor White
-        Write-Host "  resource group '$rgName' or storage account '$storageName'." -ForegroundColor White
-        Write-Host ""
-        exit 1
-    }
-    Write-OK "Public network access enabled on storage account."
+    # Private DNS zone for this sub-resource
+    $dnsZone = "privatelink.$subResource.core.windows.net"
+    az network private-dns zone create `
+        --name $dnsZone `
+        --resource-group $rgName `
+        -o none 2>$null
+
+    # Link DNS zone to our VNet so VNet-integrated apps resolve private IPs
+    az network private-dns zone vnet-link create `
+        --name "$vnetName-$subResource-link" `
+        --resource-group $rgName `
+        --zone-name $dnsZone `
+        --virtual-network $vnetName `
+        --registration-enabled false `
+        -o none 2>$null
+
+    # Create DNS records for the private endpoint
+    az network private-endpoint dns-zone-group create `
+        --name "$subResource-dns-group" `
+        --resource-group $rgName `
+        --endpoint-name $peName `
+        --private-dns-zone $dnsZone `
+        --zone-name $subResource `
+        -o none 2>$null
 }
+Write-OK "Private endpoints and DNS zones configured (blob, table, queue)."
 
-$storageUrl = "https://$storageName.table.core.windows.net"
+# Ensure public network access is disabled (enterprise policy should enforce
+# this, but we set it explicitly for correctness).
+az storage account update `
+    --name $storageName `
+    --resource-group $rgName `
+    --public-network-access Disabled `
+    -o none 2>$null
 
 # Create the TimeEntries table via ARM management plane.
-# NOTE: The "Storage Table Data Contributor" RBAC role only grants entity-level
-# operations (read/write/delete rows), NOT table creation. The createTable call
-# in the API code handles this gracefully (catches 403), but we create the table
-# at deploy time to ensure it exists without requiring elevated permissions.
+# ARM operations use the management endpoint (management.azure.com), not the
+# storage data plane, so they work regardless of network restrictions.
 az rest --method PUT `
     --url "/subscriptions/$subId/resourceGroups/$rgName/providers/Microsoft.Storage/storageAccounts/$storageName/tableServices/default/tables/TimeEntries?api-version=2023-01-01" `
     --body '{}' -o none 2>$null
 Write-OK "TimeEntries table created."
 
-# ── 3. Service Principal for Table Storage ───────────────────────────────────
+# ── 4. Service Principal for Table Storage ───────────────────────────────────
 
-Write-Step "3/8  Creating service principal for Table Storage access..."
+Write-Step "4/9  Creating service principal for Table Storage access..."
 
 # Create (or find existing) app registration
 $existingApp = az ad app list --display-name $apiAppName --query "[0].appId" -o tsv 2>$null
@@ -296,7 +356,6 @@ Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyCont
 Write-OK "Certificate credential created (thumbprint: $($cert.Thumbprint))."
 
 # Assign "Storage Table Data Contributor" role on the storage account
-$storageId = az storage account show --name $storageName --resource-group $rgName --query id -o tsv
 az role assignment create `
     --assignee-object-id $spObjectId `
     --assignee-principal-type ServicePrincipal `
@@ -305,9 +364,88 @@ az role assignment create `
     -o none 2>$null
 Write-OK "Service principal '$apiAppName' ready with Storage Table Data Contributor role."
 
-# ── 4. Static Web App ───────────────────────────────────────────────────────
+# ── 5. Azure Functions App (Flex Consumption) ────────────────────────────────
 
-Write-Step "4/8  Creating Static Web App (Standard tier)..."
+Write-Step "5/9  Creating Functions app (Flex Consumption with VNet integration)..."
+
+$storageUrl = "https://$storageName.table.core.windows.net"
+$funcSubnetId = az network vnet subnet show `
+    --name "func-integration" `
+    --resource-group $rgName `
+    --vnet-name $vnetName `
+    --query id -o tsv
+
+# Create the Flex Consumption function app with VNet integration from the start.
+# WEBSITE_CONTENTOVERVNET routes deployment storage traffic through the VNet,
+# which is required because the storage account has public access disabled.
+# Both --vnet and --subnet are required for Flex Consumption networking.
+$vnetId = az network vnet show `
+    --name $vnetName `
+    --resource-group $rgName `
+    --query id -o tsv
+
+az functionapp create `
+    --name $funcAppName `
+    --resource-group $rgName `
+    --storage-account $storageName `
+    --flexconsumption-location $Location `
+    --runtime node `
+    --runtime-version 20 `
+    --functions-version 4 `
+    --vnet $vnetId `
+    --subnet $funcSubnetId `
+    -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Failed to create Functions app. See output above."
+    exit 1
+}
+
+# Verify the app was actually created
+$funcCheck = az functionapp show --name $funcAppName --resource-group $rgName --query name -o tsv 2>$null
+if (-not $funcCheck) {
+    Write-Err "Functions app '$funcAppName' was not created. Check that the Microsoft.App provider is registered and VNet/subnet are correct."
+    exit 1
+}
+
+Write-OK "Functions app '$funcAppName' created with VNet integration."
+
+# Configure app settings for the API
+az functionapp config appsettings set `
+    --name $funcAppName `
+    --resource-group $rgName `
+    --settings `
+        "WEBSITE_CONTENTOVERVNET=1" `
+        "AZURE_TENANT_ID=$tenantId" `
+        "AZURE_CLIENT_ID=$apiAppId" `
+        "AZURE_CLIENT_CERTIFICATE=$apiCertB64" `
+        "TABLE_STORAGE_URL=$storageUrl" `
+    -o none
+Write-OK "Functions app settings configured."
+
+# Deploy the API code to the Functions app
+Write-Host "  Installing API dependencies..."
+Push-Location "$scriptDir\api"
+npm install --production 2>&1 | Out-Null
+Pop-Location
+
+Write-Host "  Packaging and deploying API code..."
+$zipPath = "$scriptDir\_api-deploy.zip"
+if (Test-Path $zipPath) { Remove-Item $zipPath }
+Compress-Archive -Path "$scriptDir\api\*" -DestinationPath $zipPath -Force
+
+az functionapp deployment source config-zip `
+    --name $funcAppName `
+    --resource-group $rgName `
+    --src $zipPath `
+    -o none 2>$null
+
+Remove-Item $zipPath -ErrorAction SilentlyContinue
+Write-OK "API code deployed to Functions app."
+
+# ── 6. Static Web App ───────────────────────────────────────────────────────
+
+Write-Step "6/9  Creating Static Web App (Standard tier)..."
 az staticwebapp create `
     --name $swaName `
     --resource-group $rgName `
@@ -316,9 +454,7 @@ az staticwebapp create `
     -o none 2>$null
 Write-OK "Static Web App '$swaName' created (Standard tier)."
 
-# Enable system-assigned managed identity.
-# NOTE: MI is not usable by SWA managed function code at runtime, but enabling
-# it is good practice and may be required by organizational policies.
+# Enable system-assigned managed identity (may be required by org policies)
 Write-Host "  Enabling managed identity..."
 $miResult = az staticwebapp identity assign `
     --name $swaName `
@@ -335,10 +471,24 @@ $swaHostname = az staticwebapp show --name $swaName --resource-group $rgName --q
 $swaUrl = "https://$swaHostname"
 Write-OK "URL: $swaUrl"
 
-# ── 5. Entra ID Auth App Registration ────────────────────────────────────────
+# Link the Functions app as the SWA backend.
+# This routes /api/* requests from SWA to the Functions app, forwarding
+# the x-ms-client-principal header for auth validation.
+Write-Host "  Linking Functions app as backend..."
+$funcAppId = az functionapp show --name $funcAppName --resource-group $rgName --query id -o tsv
+$swaId = az staticwebapp show --name $swaName --resource-group $rgName --query id -o tsv
+
+az rest --method PUT `
+    --url "$swaId/linkedBackends/${funcAppName}?api-version=2022-09-01" `
+    --body "{`"properties`":{`"backendResourceId`":`"$funcAppId`",`"region`":`"$Location`"}}" `
+    --headers "Content-Type=application/json" `
+    -o none 2>$null
+Write-OK "Functions app linked as SWA backend."
+
+# ── 7. Entra ID Auth App Registration ────────────────────────────────────────
 
 if (-not $SkipAuth) {
-    Write-Step "5/8  Creating Entra ID auth app registration..."
+    Write-Step "7/9  Creating Entra ID auth app registration..."
 
     $aadCallbackUrl = "$swaUrl/.auth/login/aad/callback"
 
@@ -415,12 +565,12 @@ if (-not $SkipAuth) {
         Write-Host "    az ad app permission admin-consent --id $authAppId" -ForegroundColor DarkGray
     }
 } else {
-    Write-Step "5/8  Skipping auth (-SkipAuth)..."
+    Write-Step "7/9  Skipping auth (-SkipAuth)..."
 }
 
-# ── 6. Generate staticwebapp.config.json ─────────────────────────────────────
+# ── 8. Generate staticwebapp.config.json + Deploy ────────────────────────────
 
-Write-Step "6/8  Generating staticwebapp.config.json..."
+Write-Step "8/9  Generating staticwebapp.config.json..."
 
 if (-not $SkipAuth) {
     # Route order matters! The /.auth/* route MUST appear before the /* catch-all
@@ -428,7 +578,6 @@ if (-not $SkipAuth) {
 
     # Built-in Microsoft identity provider (azureActiveDirectory).
     # No client secret required — SWA handles token exchange internally.
-    # This avoids issues with enterprise Entra policies that block password credentials.
     $loginRoute = "/.auth/login/aad"
     $swaConfig = @{
         auth = @{
@@ -451,48 +600,31 @@ if (-not $SkipAuth) {
             "401" = @{ redirect = $loginRoute; statusCode = 302 }
         }
         navigationFallback = @{ rewrite = "/index.html"; exclude = @("/api/*") }
-        platform = @{ apiRuntime = "node:18" }
     }
 } else {
     $swaConfig = @{
         navigationFallback = @{ rewrite = "/index.html"; exclude = @("/api/*") }
-        platform = @{ apiRuntime = "node:18" }
     }
 }
 
 $swaConfig | ConvertTo-Json -Depth 10 | Set-Content "$scriptDir\app\staticwebapp.config.json" -Encoding UTF8
 Write-OK "Config written to app/staticwebapp.config.json"
 
-# ── 7. App Settings + API Dependencies ──────────────────────────────────────
+# ── 9. Deploy Static Content + App Settings ──────────────────────────────────
 
-Write-Step "7/8  Configuring app settings and installing dependencies..."
+Write-Step "9/9  Deploying static content and configuring app settings..."
 
-$settings = @(
-    "AZURE_TENANT_ID=$tenantId",
-    "AZURE_CLIENT_ID=$apiAppId",
-    "AZURE_CLIENT_CERTIFICATE=$apiCertB64",
-    "TABLE_STORAGE_URL=$storageUrl"
-)
+# SWA app settings (auth only — storage/API settings are on the Functions app)
 if (-not $SkipAuth) {
-    $settings += "AAD_CLIENT_ID=$authAppId"
+    az staticwebapp appsettings set `
+        --name $swaName `
+        --resource-group $rgName `
+        --setting-names "AAD_CLIENT_ID=$authAppId" `
+        -o none
+    Write-OK "SWA auth settings configured."
 }
 
-az staticwebapp appsettings set `
-    --name $swaName `
-    --resource-group $rgName `
-    --setting-names @settings `
-    -o none
-Write-OK "App settings configured."
-
-Push-Location "$scriptDir\api"
-npm install --production 2>&1 | Out-Null
-Pop-Location
-Write-OK "API dependencies installed."
-
-# ── 8. Deploy ───────────────────────────────────────────────────────────────
-
-Write-Step "8/8  Deploying application..."
-
+# Deploy static content only (no --api; the API is on the linked Functions app)
 $deployToken = az staticwebapp secrets list `
     --name $swaName `
     --resource-group $rgName `
@@ -518,17 +650,12 @@ if (-not $sscExe) {
     }
 }
 
-$env:FUNCTION_LANGUAGE = "node"
-$env:FUNCTION_LANGUAGE_VERSION = "18"
-
 if ($sscExe) {
     Write-Host "  Using StaticSitesClient for deployment..."
     & $sscExe upload `
         --app "$scriptDir\app" `
-        --api "$scriptDir\api" `
         --apiToken $deployToken `
-        --skipAppBuild true `
-        --skipApiBuild true 2>&1 | ForEach-Object {
+        --skipAppBuild true 2>&1 | ForEach-Object {
             if ($_ -match "Status: Succeeded") { Write-OK $_ }
             elseif ($_ -match "Status:")        { Write-Host "  $_" }
             elseif ($_ -match "Visit your site") { Write-OK $_ }
@@ -536,8 +663,6 @@ if ($sscExe) {
 } elseif (Get-Command "swa" -ErrorAction SilentlyContinue) {
     Write-Host "  Using SWA CLI for deployment..."
     swa deploy "$scriptDir\app" `
-        --api-location "$scriptDir\api" `
-        --api-language node --api-version 18 `
         --deployment-token $deployToken 2>&1 | ForEach-Object {
             if ($_ -match "Project deployed") { Write-OK $_ }
             else { Write-Host "  $_" }
@@ -562,7 +687,8 @@ Write-Host "╚═════════════════════�
 Write-Host ""
 Write-Host "  🌐 App URL:        $swaUrl"       -ForegroundColor White
 Write-Host "  📦 Resource Group: $rgName"        -ForegroundColor White
-Write-Host "  📊 Storage:        $storageName"   -ForegroundColor White
+Write-Host "  📊 Storage:        $storageName  (private endpoint)" -ForegroundColor White
+Write-Host "  🔗 Functions:      $funcAppName  (Flex Consumption + VNet)" -ForegroundColor White
 Write-Host "  🔑 API SP:         $apiAppName"    -ForegroundColor White
 if (-not $SkipAuth) {
     Write-Host "  🔒 Auth:          Entra ID (built-in AAD, tenant $tenantId)" -ForegroundColor White

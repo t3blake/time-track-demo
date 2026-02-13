@@ -11,7 +11,8 @@ A lightweight time-tracking web app built on Azure Static Web Apps with Azure Ta
 - **Single-page time entry UI** — date, project, task, hours, billable flag, notes
 - **Persistent storage** — Azure Table Storage (no SQL database needed)
 - **Azure AD authentication** — built-in AAD provider with single-tenant Entra ID
-- **Serverless API** — Azure Functions (managed by Static Web Apps)
+- **Serverless API** — Azure Functions (Flex Consumption, linked to SWA)
+- **Enterprise-ready networking** — VNet + private endpoints (no public storage access)
 - **Zero infrastructure to manage** — all serverless, minimal cost
 <img width="895" height="983" alt="image" src="https://github.com/user-attachments/assets/04ef8600-d064-49dd-9aae-6af57a4adf11" />
 
@@ -65,8 +66,9 @@ flowchart TB
 | **Front-end** | Single HTML file served by SWA's global CDN. No build step. |
 | **Authentication** | Single-tenant Entra ID app registration using the built-in AAD provider. No client secret required — SWA handles token exchange internally. This avoids issues with enterprise Entra policies that block password credentials. Optional claims are configured to ensure SWA can identify the user. |
 | **Auth validation** | Each API function checks the `x-ms-client-principal` header to confirm the user authenticated via the built-in AAD provider (`identityProvider === "aad"`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session. |
-| **API** | Three Azure Functions (managed by SWA, Node 18). Routed automatically via `/api/*`. |
+| **API** | Three Azure Functions on a Flex Consumption plan with VNet integration. Linked to SWA as a backend — SWA forwards `/api/*` requests and the `x-ms-client-principal` auth header. |
 | **Storage auth** | A service principal with the **Storage Table Data Contributor** RBAC role authenticates via `ClientCertificateCredential`. The deploy script generates a self-signed certificate — no password credentials needed (compliant with enterprise Entra policies). |
+| **Networking** | A VNet with two subnets: one for Functions VNet integration (outbound), one for private endpoints. Storage has public network access **disabled**. The Functions app reaches storage exclusively through private endpoints + private DNS zones. |
 | **Data** | Azure Table Storage — schema-less, pay-per-use, no database server to manage. |
 
 ## Prerequisites
@@ -97,11 +99,12 @@ az login
 ```
 
 The script prompts for a **prefix** (e.g. your alias) to generate unique Azure resource names. Then it will:
-1. Create a resource group, storage account, and Static Web App (Standard tier)
+1. Create a resource group, VNet, and storage account with private endpoints
 2. Create a service principal with a certificate credential for Table Storage access
-3. Register an Entra ID auth app with API permissions and optional claims
-4. Generate the SWA config with built-in AAD auth routes
-5. Configure all app settings and deploy the app + API
+3. Create a Flex Consumption Functions app with VNet integration
+4. Create a Static Web App (Standard) and link the Functions app as its backend
+5. Register an Entra ID auth app with API permissions and optional claims
+6. Generate the SWA config and deploy static content
 
 At the end it prints the URL to open in your browser.
 
@@ -148,30 +151,33 @@ time-entry-demo/
 | Resource | Tier | Approximate cost |
 |----------|------|------------------|
 | **Static Web Apps** | Standard | ~$9/month |
+| **Azure Functions** | Flex Consumption | ~$0 for demo traffic (pay-per-execution) |
 | **Azure Table Storage** | Standard LRS | ~$0.045/GB/month (pennies for demo usage) |
-| **Azure Functions** | Managed by SWA | Included with SWA tier |
+| **VNet + Private Endpoints** | Standard | ~$7/month (3 PEs × ~$2.30 each) |
+| **Private DNS Zones** | Standard | ~$0.75/month (3 zones × $0.25 each) |
 
-The deploy script creates a **Standard** tier SWA (~$9/month). Standard is required in environments with restrictive Entra ID policies and also enables features like custom domains and higher bandwidth limits.
+Total: **~$17/month** for a fully enterprise-compliant deployment with no public storage access.
 
-> **Note on managed identity:** Standard tier enables managed identity on the SWA resource, but SWA managed functions **cannot** use it at runtime (`IDENTITY_HEADER` is not exposed to function code). The API uses a service principal instead. A linked Azure Functions app would be needed for full MI support.
+> **Note on managed identity:** The Functions app could use managed identity for storage access, but a service principal with certificate credential is used instead for consistency with enterprise Entra policies and to keep the deployment script self-contained.
 
 ## Troubleshooting
 
 ### "Too many redirects" after deploying
-The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.config.json`. Without it, unauthenticated requests to `/.auth/login/entra` match the `/*` rule (which requires `authenticated`), triggering a 302 back to `/.auth/login/entra` — an infinite loop. The deploy script handles this automatically.
+The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.config.json`. Without it, unauthenticated requests to `/.auth/login/aad` match the `/*` rule (which requires `authenticated`), triggering a 302 back to `/.auth/login/aad` — an infinite loop. The deploy script handles this automatically.
 
 ### "Could not load entries" or API returns 500
 | Cause | Fix |
 |-------|-----|
-| **Storage account has public access disabled** | The deploy script automatically enables public network access and verifies it. If Azure Policy blocks this, ask your admin for a policy exemption — SWA managed functions cannot use private endpoints. |
+| **Functions app not linked to SWA** | Check `az staticwebapp backends list`. Re-run `deploy.ps1` to re-link. |
+| **Private endpoint DNS not resolving** | Verify the private DNS zones exist and are linked to the VNet. Re-run `deploy.ps1`. |
 | **TimeEntries table doesn't exist** | Re-run `deploy.ps1` — it creates the table via ARM at deploy time. |
-| **Missing app settings** | Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE`, `TABLE_STORAGE_URL`, and `AAD_CLIENT_ID` are set on the SWA. |
+| **Missing app settings on Functions app** | Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE`, `TABLE_STORAGE_URL` on the Functions app, and `AAD_CLIENT_ID` on the SWA. |
 | **Service principal certificate expired** | Re-run `deploy.ps1` — it generates a fresh 1-year certificate. |
 
 ### Checking API logs
 ```powershell
-# Stream live logs from the SWA (replace <prefix> with your prefix)
-az staticwebapp functions show --name <prefix>-demo --resource-group rg-<prefix>-demo
+# Stream live logs from the Functions app
+az functionapp log tail --name <prefix>-demo-api --resource-group rg-<prefix>-demo
 ```
 
 ## Security Notes
@@ -180,8 +186,8 @@ az staticwebapp functions show --name <prefix>-demo --resource-group rg-<prefix>
 - **Optional claims**: The auth app is configured with optional ID token claims (`email`, `preferred_username`, `upn`) to ensure SWA can identify the user. Without these, SWA returns a 403 `invalidUserInfo` or enters a redirect loop.
 - **API-level auth validation**: For defense in depth, every API function checks the `x-ms-client-principal` header to confirm the user authenticated via the built-in AAD provider (`identityProvider === "aad"`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session.
 - **Certificate-based storage auth**: The API uses `ClientCertificateCredential` with a deploy-time generated self-signed certificate (1-year expiry). The PEM is stored as a base64-encoded app setting (encrypted at rest). No password credentials are created for the API service principal.
-- **Why not managed identity?** SWA managed functions do not expose `IDENTITY_HEADER` or the MSI endpoint to user code. `DefaultAzureCredential` fails entirely. This is a [known platform limitation](https://learn.microsoft.com/en-us/azure/static-web-apps/apis-functions).
-- **Storage network access**: The storage account uses public network access. To fully lock it down, you'd need to replace SWA managed functions with a linked Azure Functions app that supports VNet integration and private endpoints.
+- **Private network storage**: The storage account has **public network access disabled**. The Functions app reaches storage exclusively through VNet integration + private endpoints + private DNS zones. No storage data traverses the public internet.
+- **Linked backend**: The SWA forwards `/api/*` requests to the Functions app as a linked backend, including the `x-ms-client-principal` header for auth validation. The Functions app accepts inbound traffic from SWA's backend linking mechanism.
 
 ## Cleanup
 

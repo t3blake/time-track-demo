@@ -8,6 +8,10 @@ api/package-lock.json
 # Generated config (created by deploy.ps1 per-tenant)
 app/staticwebapp.config.json
 
+# Deploy artifacts
+_api-deploy.zip
+_claims.json
+
 # Environment / secret files — never commit these
 .env
 .env.*
