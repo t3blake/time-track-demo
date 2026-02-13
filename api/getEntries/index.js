@@ -1,21 +1,14 @@
-if (!globalThis.crypto) { globalThis.crypto = require("crypto").webcrypto; }
-
 const { TableClient, TableServiceClient } = require("@azure/data-tables");
-const { ClientCertificateCredential } = require("@azure/identity");
+const { DefaultAzureCredential } = require("@azure/identity");
 
-function getCred() {
-  const pem = Buffer.from(process.env.AZURE_CLIENT_CERTIFICATE, "base64").toString("utf8");
-  return new ClientCertificateCredential(
-    process.env.AZURE_TENANT_ID,
-    process.env.AZURE_CLIENT_ID,
-    { certificate: pem }
-  );
-}
+// Reused across invocations — DefaultAzureCredential automatically picks up the
+// system-assigned managed identity when running on Azure Functions.
+const credential = new DefaultAzureCredential();
 
 // Validate that the caller authenticated through our Entra ID provider.
-// The built-in AAD provider sets identityProvider to 'aad'. Since the
-// provider is configured with a single-tenant issuer URL, only users
-// from the expected tenant can obtain a valid session.
+// The built-in AAD provider sets identityProvider to 'aad'. Since the provider
+// is configured with a single-tenant issuer URL, only users from the expected
+// tenant can obtain a valid session.
 function validateAuth(req) {
   const header = req.headers["x-ms-client-principal"];
   if (!header) return false;
@@ -34,11 +27,10 @@ module.exports = async function (context, req) {
     return;
   }
   try {
-    const cred = getCred();
-    const svc = new TableServiceClient(url, cred);
+    const svc = new TableServiceClient(url, credential);
     try { await svc.createTable("TimeEntries"); } catch (e) { if (e.statusCode !== 409 && e.statusCode !== 403) throw e; }
 
-    const client = new TableClient(url, "TimeEntries", cred);
+    const client = new TableClient(url, "TimeEntries", credential);
     const entries = [];
     for await (const entity of client.listEntities({ queryOptions: { filter: "PartitionKey eq 'demo'" } })) {
       entries.push({

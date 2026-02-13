@@ -20,43 +20,42 @@ A lightweight time-tracking web app built on Azure Static Web Apps with Azure Ta
 
 ```mermaid
 flowchart TB
-    subgraph Browser["🌐 Browser"]
+    subgraph Browser["Browser"]
         UI["index.html<br/>(Single-page app)"]
     end
 
-    subgraph AAD["Microsoft Entra ID<br/>(Single-tenant)"]
+    subgraph AAD["Microsoft Entra ID"]
         Login["/.auth/login/aad<br/>Built-in AAD provider"]
     end
 
     subgraph AzureSub["Azure Subscription"]
-        subgraph SWA["Azure Static Web Apps (Standard)"]
-            direction TB
+        subgraph SWA["Static Web App (Standard)"]
             Static["Static Hosting<br/>(app/)"]
-            subgraph Functions["Managed Azure Functions (Node 18)"]
-                Validate["Auth validation<br/>(x-ms-client-principal)"]
-                GET["GET /api/entries"]
-                POST["POST /api/entries"]
-                DELETE["DELETE /api/entries/{id}"]
-            end
         end
 
-        subgraph Storage["Azure Storage Account"]
+        subgraph Functions["Azure Functions (Flex Consumption, Node 20)"]
+            Validate["Auth validation<br/>(x-ms-client-principal)"]
+            GET["GET /api/entries"]
+            POST["POST /api/entries"]
+            DELETE["DELETE /api/entries/{id}"]
+        end
+
+        subgraph VNet["VNet"]
+            PE["Private Endpoints<br/>(blob, table, queue)"]
+        end
+
+        subgraph Storage["Storage Account<br/>(public access disabled)"]
             Table["Table Storage<br/>TimeEntries"]
-        end
-
-        subgraph RBAC["Entra ID App Registrations"]
-            AuthApp["Auth App<br/>(built-in AAD provider)"]
-            SP["API Service Principal<br/>📜 Certificate credential<br/>Storage Table Data Contributor"]
         end
     end
 
     UI -- "HTTPS" --> Static
     UI -. "/.auth/login/aad<br/>(302 redirect)" .-> Login
     Login -. "ID token + cookie" .-> Static
-    Static -- "/api/*" --> Validate
+    Static -- "/api/* (linked backend)" --> Validate
     Validate -- "provider OK" --> GET & POST & DELETE
-    GET & POST & DELETE -- "ClientCertificateCredential" --> SP
-    SP -- "RBAC" --> Table
+    Functions -- "Managed Identity<br/>(DefaultAzureCredential)" --> PE
+    PE -- "Private DNS" --> Table
 ```
 
 ### How it works
@@ -67,15 +66,15 @@ flowchart TB
 | **Authentication** | Single-tenant Entra ID app registration using the built-in AAD provider. No client secret required — SWA handles token exchange internally. This avoids issues with enterprise Entra policies that block password credentials. Optional claims are configured to ensure SWA can identify the user. |
 | **Auth validation** | Each API function checks the `x-ms-client-principal` header to confirm the user authenticated via the built-in AAD provider (`identityProvider === "aad"`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session. |
 | **API** | Three Azure Functions on a Flex Consumption plan with VNet integration. Linked to SWA as a backend — SWA forwards `/api/*` requests and the `x-ms-client-principal` auth header. |
-| **Storage auth** | A service principal with the **Storage Table Data Contributor** RBAC role authenticates via `ClientCertificateCredential`. The deploy script generates a self-signed certificate — no password credentials needed (compliant with enterprise Entra policies). |
-| **Networking** | A VNet with two subnets: one for Functions VNet integration (outbound), one for private endpoints. Storage has public network access **disabled**. The Functions app reaches storage exclusively through private endpoints + private DNS zones. |
+| **Storage auth** | The Functions app's **system-assigned managed identity** has the **Storage Table Data Contributor** RBAC role. The API code uses `DefaultAzureCredential` which automatically picks up the managed identity — no secrets, no certificates, no expiry. |
+| **Networking** | A VNet with two subnets: one for Functions VNet integration (outbound), one for private endpoints. Storage has public network access **disabled** and shared-key auth **disabled**. The Functions app reaches storage exclusively through private endpoints + private DNS zones. |
 | **Data** | Azure Table Storage — schema-less, pay-per-use, no database server to manage. |
 
 ## Prerequisites
 
 | Tool | Minimum Version | Install |
 |------|----------------|---------|
-| **Windows** | 10 or 11 | Required (uses `New-SelfSignedCertificate` for cert generation) |
+
 | **PowerShell** | 7+ | Built into Windows 11, or [install](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell) |
 | **Azure CLI** | 2.50+ | `winget install Microsoft.AzureCLI` |
 | **Node.js** | 18+ | `winget install OpenJS.NodeJS.LTS` |
@@ -100,11 +99,10 @@ az login
 
 The script prompts for a **prefix** (e.g. your alias) to generate unique Azure resource names. Then it will:
 1. Create a resource group, VNet, and storage account with private endpoints
-2. Create a service principal with a certificate credential for Table Storage access
-3. Create a Flex Consumption Functions app with VNet integration
-4. Create a Static Web App (Standard) and link the Functions app as its backend
-5. Register an Entra ID auth app with API permissions and optional claims
-6. Generate the SWA config and deploy static content
+2. Create a Flex Consumption Functions app with VNet integration and managed identity
+3. Create a Static Web App (Standard) and link the Functions app as its backend
+4. Register an Entra ID auth app with API permissions and optional claims
+5. Generate the SWA config and deploy static content
 
 At the end it prints the URL to open in your browser.
 
@@ -158,8 +156,6 @@ time-entry-demo/
 
 Total: **~$17/month** for a fully enterprise-compliant deployment with no public storage access.
 
-> **Note on managed identity:** The Functions app could use managed identity for storage access, but a service principal with certificate credential is used instead for consistency with enterprise Entra policies and to keep the deployment script self-contained.
-
 ## Troubleshooting
 
 ### "Too many redirects" after deploying
@@ -171,8 +167,8 @@ The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.
 | **Functions app not linked to SWA** | Check `az staticwebapp backends list`. Re-run `deploy.ps1` to re-link. |
 | **Private endpoint DNS not resolving** | Verify the private DNS zones exist and are linked to the VNet. Re-run `deploy.ps1`. |
 | **TimeEntries table doesn't exist** | Re-run `deploy.ps1` — it creates the table via ARM at deploy time. |
-| **Missing app settings on Functions app** | Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE`, `TABLE_STORAGE_URL` on the Functions app, and `AAD_CLIENT_ID` on the SWA. |
-| **Service principal certificate expired** | Re-run `deploy.ps1` — it generates a fresh 1-year certificate. |
+| **Missing app settings on Functions app** | Check `TABLE_STORAGE_URL` and `AzureWebJobsStorage__accountName` on the Functions app, and `AAD_CLIENT_ID` on the SWA. |
+| **Managed identity RBAC not propagated** | RBAC assignments can take up to 10 minutes. Wait and retry, or re-run `deploy.ps1`. |
 
 ### Checking API logs
 ```powershell
@@ -185,8 +181,8 @@ az functionapp log tail --name <prefix>-demo-api --resource-group rg-<prefix>-de
 - **Built-in AAD provider**: Uses the SWA built-in `azureActiveDirectory` identity provider (`/.auth/login/aad`). No client secret is required — SWA handles the token exchange internally. This avoids issues with enterprise Entra policies that block password credentials on app registrations.
 - **Optional claims**: The auth app is configured with optional ID token claims (`email`, `preferred_username`, `upn`) to ensure SWA can identify the user. Without these, SWA returns a 403 `invalidUserInfo` or enters a redirect loop.
 - **API-level auth validation**: For defense in depth, every API function checks the `x-ms-client-principal` header to confirm the user authenticated via the built-in AAD provider (`identityProvider === "aad"`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session.
-- **Certificate-based storage auth**: The API uses `ClientCertificateCredential` with a deploy-time generated self-signed certificate (1-year expiry). The PEM is stored as a base64-encoded app setting (encrypted at rest). No password credentials are created for the API service principal.
-- **Private network storage**: The storage account has **public network access disabled**. The Functions app reaches storage exclusively through VNet integration + private endpoints + private DNS zones. No storage data traverses the public internet.
+- **Managed identity storage auth**: The Functions app uses its system-assigned managed identity with `DefaultAzureCredential` to access Table Storage. The managed identity has the **Storage Table Data Contributor** RBAC role. No secrets, certificates, or connection strings are used — nothing to rotate or expire.
+- **Storage lockdown**: The storage account has **public network access disabled** and **shared-key auth disabled** (`allowSharedKeyAccess: false`). All access is via managed identity through VNet integration + private endpoints + private DNS zones. No storage data traverses the public internet.
 - **Linked backend**: The SWA forwards `/api/*` requests to the Functions app as a linked backend, including the `x-ms-client-principal` header for auth validation. The Functions app accepts inbound traffic from SWA's backend linking mechanism.
 
 ## Cleanup

@@ -1,16 +1,7 @@
-if (!globalThis.crypto) { globalThis.crypto = require("crypto").webcrypto; }
-
 const { TableClient, TableServiceClient } = require("@azure/data-tables");
-const { ClientCertificateCredential } = require("@azure/identity");
+const { DefaultAzureCredential } = require("@azure/identity");
 
-function getCred() {
-  const pem = Buffer.from(process.env.AZURE_CLIENT_CERTIFICATE, "base64").toString("utf8");
-  return new ClientCertificateCredential(
-    process.env.AZURE_TENANT_ID,
-    process.env.AZURE_CLIENT_ID,
-    { certificate: pem }
-  );
-}
+const credential = new DefaultAzureCredential();
 
 // Validate that the caller authenticated through our Entra ID provider.
 // The built-in AAD provider sets identityProvider to 'aad'.
@@ -32,12 +23,11 @@ module.exports = async function (context, req) {
     return;
   }
   try {
-    const cred = getCred();
-    const svc = new TableServiceClient(url, cred);
+    const svc = new TableServiceClient(url, credential);
     try { await svc.createTable("TimeEntries"); } catch (e) { if (e.statusCode !== 409 && e.statusCode !== 403) throw e; }
 
     const id = context.bindingData.id;
-    const client = new TableClient(url, "TimeEntries", cred);
+    const client = new TableClient(url, "TimeEntries", credential);
     await client.deleteEntity("demo", id);
     context.res = { status: 200, headers: { "Content-Type": "application/json" }, body: { deleted: id } };
   } catch (err) {

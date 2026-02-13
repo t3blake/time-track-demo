@@ -3,15 +3,14 @@
 #   - Azure Table Storage for persistence (private endpoint, no public access)
 #   - Entra ID authentication (built-in AAD provider, single-tenant)
 #   - Linked Azure Functions API (Flex Consumption, VNet-integrated)
-#   - Certificate-based service principal auth for Table Storage
+#   - Managed identity for all storage access (no keys, no passwords)
 #
 # Network architecture:
 #   SWA → Linked Backend → Functions App → VNet → Private Endpoint → Storage
-#   Storage has public network access DISABLED. The Functions app reaches it
-#   through VNet integration and a private endpoint + private DNS zone.
+#   Storage has public network access DISABLED and shared-key auth DISABLED.
+#   The Functions app reaches storage through VNet integration + private endpoints.
 #
 # Prerequisites:
-#   - Windows 10/11 (uses New-SelfSignedCertificate and the Windows cert store)
 #   - Azure CLI (az) installed and logged in
 #   - Node.js 18+ installed
 #   - PowerShell 7+
@@ -149,7 +148,6 @@ $tenantId = $account.tenantId
 $swaName     = "$Prefix-demo"
 $storageName = (($Prefix -replace '[^a-z0-9]','') + "demostore").ToLower()
 if ($storageName.Length -gt 24) { $storageName = $storageName.Substring(0, 24) }
-$apiAppName  = "$Prefix-table-api"
 $authAppName = "$Prefix-swa-auth"
 $funcAppName = "$Prefix-demo-api"
 $vnetName    = "$Prefix-demo-vnet"
@@ -170,7 +168,6 @@ if ($Teardown) {
     # ── 1. Always safe: delete Entra app registrations we created ──
     Write-Host ""
     Write-Host "  The following Entra app registrations will be deleted:" -ForegroundColor White
-    Write-Host "    - $apiAppName  (API service principal)" -ForegroundColor DarkGray
     Write-Host "    - $authAppName (SWA auth app)" -ForegroundColor DarkGray
 
     if ($isOurRg) {
@@ -184,7 +181,6 @@ if ($Teardown) {
         Write-Host "    - $funcAppName     (Functions app)" -ForegroundColor DarkGray
         Write-Host "    - $swaName         (Static Web App)" -ForegroundColor DarkGray
         Write-Host "    - $storageName     (Storage account)" -ForegroundColor DarkGray
-        Write-Host "    - $apiAppName      (API app registration)" -ForegroundColor DarkGray
         Write-Host "    - $authAppName     (Auth app registration)" -ForegroundColor DarkGray
         Write-Warn "VNet, subnets, private endpoints, and DNS zones will NOT be deleted."
         Write-Warn "Clean those up manually if no longer needed."
@@ -195,7 +191,7 @@ if ($Teardown) {
     if ($confirm -ne 'yes') { Write-Host "Aborted."; exit 0 }
 
     # Delete app registrations (always safe)
-    foreach ($appDisplayName in @($apiAppName, $authAppName)) {
+    foreach ($appDisplayName in @($authAppName)) {
         $apps = az ad app list --display-name $appDisplayName --query "[].appId" -o tsv 2>$null
         foreach ($appId in $apps) {
             Write-Host "  Deleting app registration $appId ($appDisplayName)..."
@@ -270,7 +266,7 @@ if ($Teardown) {
 
 # ── 1. Resource Group ────────────────────────────────────────────────────────
 
-Write-Step "1/9  Resource group..."
+Write-Step "1/8  Resource group..."
 
 $usingExistingRg = $false
 
@@ -312,7 +308,7 @@ if (-not $usingExistingRg) {
 
 # ── 2. Virtual Network & Subnets ─────────────────────────────────────────────
 
-Write-Step "2/9  Virtual network and subnets..."
+Write-Step "2/8  Virtual network and subnets..."
 
 # Pre-register the Microsoft.App resource provider (required for Flex Consumption
 # Functions). We do this early so it has time to complete before Step 5.
@@ -566,13 +562,12 @@ Write-Host "  Static Web App:   $swaName"
 Write-Host "  Functions App:    $funcAppName  (Flex Consumption)"
 Write-Host "  Storage Account:  $storageName  (private endpoint)"
 Write-Host "  Location:         $Location"
-Write-Host "  API SP:           $apiAppName"
 if (-not $SkipAuth) { Write-Host "  Auth App:         $authAppName" }
 Write-Host ""
 
 # ── 3. Storage Account + Private Endpoints + Table ───────────────────────────
 
-Write-Step "3/9  Creating storage account with private endpoints..."
+Write-Step "3/8  Creating storage account with private endpoints..."
 
 az storage account create `
     --name $storageName `
@@ -647,69 +642,9 @@ az rest --method PUT `
     --body '{}' -o none 2>$null
 Write-OK "TimeEntries table created."
 
-# ── 4. Service Principal for Table Storage ───────────────────────────────────
+# ── 4. Azure Functions App (Flex Consumption) ────────────────────────────────
 
-Write-Step "4/9  Creating service principal for Table Storage access..."
-
-# Create (or find existing) app registration
-$existingApp = az ad app list --display-name $apiAppName --query "[0].appId" -o tsv 2>$null
-if ($existingApp) {
-    $apiAppId = $existingApp
-    Write-Host "  Using existing app registration: $apiAppId"
-} else {
-    $apiApp = az ad app create --display-name $apiAppName -o json | ConvertFrom-Json
-    $apiAppId = $apiApp.appId
-}
-
-# Ensure service principal exists (idempotent — silently ignores "already exists")
-az ad sp create --id $apiAppId 2>$null | Out-Null
-$spObjectId = az ad sp show --id $apiAppId --query id -o tsv
-
-# Create a self-signed certificate credential (1-year expiry).
-# Certificate credentials are used instead of passwords because most enterprise
-# tenants have Entra policies that block password credentials on app registrations.
-Write-Host "  Generating self-signed certificate..."
-$certSubject = "CN=$apiAppName"
-$cert = New-SelfSignedCertificate `
-    -Subject $certSubject `
-    -CertStoreLocation "Cert:\CurrentUser\My" `
-    -KeyExportPolicy Exportable `
-    -NotAfter (Get-Date).AddYears(1) `
-    -KeyAlgorithm RSA -KeyLength 2048 `
-    -HashAlgorithm SHA256
-
-# Upload public key to the app registration
-$certBase64 = [Convert]::ToBase64String($cert.RawData)
-az ad app credential reset --id $apiAppId --cert $certBase64 --append -o none 2>$null
-
-# Build PEM string (certificate + private key) for the API to use at runtime
-$certPemBody = [Convert]::ToBase64String($cert.RawData, [System.Base64FormattingOptions]::InsertLineBreaks)
-$certPem = "-----BEGIN CERTIFICATE-----`n$certPemBody`n-----END CERTIFICATE-----"
-$rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
-$keyBytes = $rsa.ExportPkcs8PrivateKey()
-$keyPemBody = [Convert]::ToBase64String($keyBytes, [System.Base64FormattingOptions]::InsertLineBreaks)
-$keyPem = "-----BEGIN PRIVATE KEY-----`n$keyPemBody`n-----END PRIVATE KEY-----"
-$fullPem = $certPem + "`n" + $keyPem
-
-# Base64-encode the full PEM so it can be stored as a single app setting
-$apiCertB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($fullPem))
-
-# Clean up from local cert store
-Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
-Write-OK "Certificate credential created (thumbprint: $($cert.Thumbprint))."
-
-# Assign "Storage Table Data Contributor" role on the storage account
-az role assignment create `
-    --assignee-object-id $spObjectId `
-    --assignee-principal-type ServicePrincipal `
-    --role "Storage Table Data Contributor" `
-    --scope $storageId `
-    -o none 2>$null
-Write-OK "Service principal '$apiAppName' ready with Storage Table Data Contributor role."
-
-# ── 5. Azure Functions App (Flex Consumption) ────────────────────────────────
-
-Write-Step "5/9  Creating Functions app (Flex Consumption with VNet integration)..."
+Write-Step "4/8  Creating Functions app (Flex Consumption with VNet integration)..."
 
 $storageUrl = "https://$storageName.table.core.windows.net"
 
@@ -820,9 +755,6 @@ az functionapp config appsettings set `
     --settings `
         "AzureWebJobsStorage__accountName=$storageName" `
         "WEBSITE_CONTENTOVERVNET=1" `
-        "AZURE_TENANT_ID=$tenantId" `
-        "AZURE_CLIENT_ID=$apiAppId" `
-        "AZURE_CLIENT_CERTIFICATE=$apiCertB64" `
         "TABLE_STORAGE_URL=$storageUrl" `
     -o none
 Write-OK "Functions app settings configured."
@@ -865,9 +797,9 @@ if (-not $deploySuccess) {
 }
 Write-OK "API code deployed to Functions app."
 
-# ── 6. Static Web App ───────────────────────────────────────────────────────
+# ── 5. Static Web App ───────────────────────────────────────────────────────
 
-Write-Step "6/9  Creating Static Web App (Standard tier)..."
+Write-Step "5/8  Creating Static Web App (Standard tier)..."
 az staticwebapp create `
     --name $swaName `
     --resource-group $rgName `
@@ -926,10 +858,10 @@ if (-not $linkedBackends.value -or $linkedBackends.value.Count -eq 0) {
 }
 Write-OK "Functions app linked as SWA backend."
 
-# ── 7. Entra ID Auth App Registration ────────────────────────────────────────
+# ── 6. Entra ID Auth App Registration ────────────────────────────────────────
 
 if (-not $SkipAuth) {
-    Write-Step "7/9  Creating Entra ID auth app registration..."
+    Write-Step "6/8  Creating Entra ID auth app registration..."
 
     $aadCallbackUrl = "$swaUrl/.auth/login/aad/callback"
 
@@ -1010,12 +942,12 @@ if (-not $SkipAuth) {
         Write-Host "    az ad app permission admin-consent --id $authAppId" -ForegroundColor DarkGray
     }
 } else {
-    Write-Step "7/9  Skipping auth (-SkipAuth)..."
+    Write-Step "6/8  Skipping auth (-SkipAuth)..."
 }
 
-# ── 8. Generate staticwebapp.config.json + Deploy ────────────────────────────
+# ── 7. Generate staticwebapp.config.json + Deploy ────────────────────────────
 
-Write-Step "8/9  Generating staticwebapp.config.json..."
+Write-Step "7/8  Generating staticwebapp.config.json..."
 
 if (-not $SkipAuth) {
     # Route order matters! The /.auth/* route MUST appear before the /* catch-all
@@ -1055,9 +987,9 @@ if (-not $SkipAuth) {
 $swaConfig | ConvertTo-Json -Depth 10 | Set-Content "$scriptDir\app\staticwebapp.config.json" -Encoding UTF8
 Write-OK "Config written to app/staticwebapp.config.json"
 
-# ── 9. Deploy Static Content + App Settings ──────────────────────────────────
+# ── 8. Deploy Static Content + App Settings ──────────────────────────────────
 
-Write-Step "9/9  Deploying static content and configuring app settings..."
+Write-Step "8/8  Deploying static content and configuring app settings..."
 
 # SWA app settings (auth only — storage/API settings are on the Functions app)
 if (-not $SkipAuth) {
@@ -1134,7 +1066,6 @@ Write-Host "  🌐 App URL:        $swaUrl"       -ForegroundColor White
 Write-Host "  📦 Resource Group: $rgName"        -ForegroundColor White
 Write-Host "  📊 Storage:        $storageName  (private endpoint)" -ForegroundColor White
 Write-Host "  🔗 Functions:      $funcAppName  (Flex Consumption + VNet)" -ForegroundColor White
-Write-Host "  🔑 API SP:         $apiAppName"    -ForegroundColor White
 if (-not $SkipAuth) {
     Write-Host "  🔒 Auth:          Entra ID (built-in AAD, tenant $tenantId)" -ForegroundColor White
     Write-Host "  🆔 Auth App:       $authAppName ($authAppId)" -ForegroundColor White
