@@ -581,8 +581,9 @@ az storage account create `
     --sku Standard_LRS `
     --min-tls-version TLS1_2 `
     --allow-blob-public-access false `
+    --allow-shared-key-access false `
     -o none
-Write-OK "Storage account '$storageName' created."
+Write-OK "Storage account '$storageName' created (shared-key auth disabled)."
 
 $storageId = az storage account show --name $storageName --resource-group $rgName --query id -o tsv
 
@@ -801,19 +802,16 @@ az rest --method patch --uri "${funcId}?api-version=2023-12-01" --body "@$patchF
 Remove-Item $patchFile -ErrorAction SilentlyContinue
 Write-OK "Deployment storage switched to managed identity auth."
 
-# Wait for RBAC propagation (identity-based storage requires this)
-Write-Host "  Waiting for RBAC propagation (up to 5 min)..."
-$rbacReady = $false
-for ($i = 0; $i -lt 30; $i++) {
-    Start-Sleep 10
-    # Check if the deployment container is accessible
-    $depStatus = az rest --method get --uri "${funcId}?api-version=2023-12-01" `
-        --query "properties.functionAppConfig.deployment.storage.authentication.type" -o tsv 2>$null
-    if ($depStatus -eq "systemassignedidentity") { $rbacReady = $true; break }
+# Wait for RBAC propagation before deploying.
+# Azure RBAC assignments on storage can take 1-10 minutes to become effective.
+# We cannot test data-plane access from the CLI (public access is disabled), so
+# we use a fixed wait combined with deployment retries as a safety net.
+Write-Host "  Waiting 2 minutes for RBAC propagation..."
+for ($i = 120; $i -gt 0; $i -= 30) {
+    Write-Host "    ${i}s remaining..." -ForegroundColor DarkGray
+    Start-Sleep ([Math]::Min(30, $i))
 }
-if (-not $rbacReady) {
-    Write-Warn "RBAC may still be propagating. Deployment will retry if needed."
-}
+Write-OK "RBAC propagation wait complete."
 
 # Configure app settings for the API
 az functionapp config appsettings set `
