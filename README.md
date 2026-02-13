@@ -63,8 +63,8 @@ flowchart TB
 | Layer | Details |
 |-------|---------|
 | **Front-end** | Single HTML file served by SWA's global CDN. No build step. |
-| **Authentication** | Custom OIDC provider (`/.auth/login/entra`) backed by a single-tenant Entra ID app registration. The deploy script creates the app, client secret (via Graph API), and configures optional claims automatically. |
-| **Auth validation** | Each API function checks the `x-ms-client-principal` header to confirm the user authenticated via the custom OIDC provider (defense in depth). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session. |
+| **Authentication** | Single-tenant Entra ID app registration. The deploy script tries the custom OIDC provider first (requires a client secret). If the tenant's credential policy blocks secrets, it automatically falls back to the built-in AAD provider (no secret needed). Optional claims are configured either way. |
+| **Auth validation** | Each API function checks the `x-ms-client-principal` header to confirm the user authenticated via an Entra ID provider (accepts both `entra` and `aad`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session. |
 | **API** | Three Azure Functions (managed by SWA, Node 18). Routed automatically via `/api/*`. |
 | **Storage auth** | A service principal with the **Storage Table Data Contributor** RBAC role authenticates via `ClientCertificateCredential`. The deploy script generates a self-signed certificate — no password credentials needed (compliant with enterprise Entra policies). |
 | **Data** | Azure Table Storage — schema-less, pay-per-use, no database server to manage. |
@@ -176,9 +176,12 @@ az staticwebapp functions show --name <prefix>-demo --resource-group rg-<prefix>
 
 ## Security Notes
 
-- **Custom OIDC authentication**: Uses a custom OpenID Connect provider (`/.auth/login/entra`) backed by a single-tenant Entra ID app registration. The deploy script creates the app registration, client secret (via Graph API to bypass policies that block `az ad app credential reset`), API permissions, and optional claims automatically.
+- **Adaptive authentication**: The deploy script tries two auth approaches in order:
+  1. **Custom OIDC provider** (`/.auth/login/entra`) — uses a client secret created via Graph API. This is the preferred approach.
+  2. **Built-in AAD provider** (`/.auth/login/aad`) — used as a fallback when the tenant has an app credential policy that blocks password credentials. No client secret required.
+  Both providers use a single-tenant Entra ID app registration with optional claims.
 - **Optional claims**: The auth app is configured with optional ID token claims (`email`, `preferred_username`, `upn`) to ensure SWA can identify the user. Without these, SWA returns a 403 `invalidUserInfo` or enters a redirect loop.
-- **API-level auth validation**: For defense in depth, every API function checks that the `x-ms-client-principal` header confirms the user authenticated via the custom OIDC provider (`identityProvider === "entra"`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session. Note: Custom OIDC providers on SWA do not populate claims in the `x-ms-client-principal` header sent to API functions, so claim-based checks are not possible.
+- **API-level auth validation**: For defense in depth, every API function checks the `x-ms-client-principal` header to confirm the user authenticated via an Entra ID provider (accepts both `identityProvider === "entra"` and `"aad"`). Since both providers are configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session.
 - **Certificate-based storage auth**: The API uses `ClientCertificateCredential` with a deploy-time generated self-signed certificate (1-year expiry). The PEM is stored as a base64-encoded app setting (encrypted at rest). No password credentials are created for the API service principal.
 - **Why not managed identity?** SWA managed functions do not expose `IDENTITY_HEADER` or the MSI endpoint to user code. `DefaultAzureCredential` fails entirely. This is a [known platform limitation](https://learn.microsoft.com/en-us/azure/static-web-apps/apis-functions).
 - **Storage network access**: The storage account uses public network access. To fully lock it down, you'd need to replace SWA managed functions with a linked Azure Functions app that supports VNet integration and private endpoints.

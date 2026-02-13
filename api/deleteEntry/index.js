@@ -12,14 +12,13 @@ function getCred() {
   );
 }
 
-// Validate that the caller authenticated through our custom OIDC provider.
-// The provider is configured with a single-tenant issuer URL, so only users
-// from the expected tenant can obtain a valid session.
+// Validate that the caller authenticated through our Entra ID provider.
+// Accepts both 'entra' (custom OIDC) and 'aad' (built-in) providers.
 function validateAuth(req) {
   const header = req.headers["x-ms-client-principal"];
   if (!header) return false;
   const principal = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
-  return principal.identityProvider === "entra";
+  return principal.identityProvider === "entra" || principal.identityProvider === "aad";
 }
 
 module.exports = async function (context, req) {
