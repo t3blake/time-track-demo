@@ -161,16 +161,40 @@ $rgName = if ($ResourceGroup) { $ResourceGroup } else { "rg-$Prefix-demo" }
 # ── Teardown ─────────────────────────────────────────────────────────────────
 
 if ($Teardown) {
-    Write-Step "Tearing down all resources..."
-    if ($ResourceGroup) {
-        Write-Warn "You specified -ResourceGroup '$rgName'."
-        Write-Warn "Teardown will DELETE this entire resource group and everything in it."
-        Write-Warn "If this is a shared RG, consider manually deleting only the demo resources instead."
+    Write-Step "Tearing down resources..."
+
+    # Determine if this RG was created by the script (default name pattern) or user-supplied
+    $defaultRgName = "rg-$Prefix-demo"
+    $isOurRg = ($rgName -eq $defaultRgName) -and (-not $ResourceGroup)
+
+    # ── 1. Always safe: delete Entra app registrations we created ──
+    Write-Host ""
+    Write-Host "  The following Entra app registrations will be deleted:" -ForegroundColor White
+    Write-Host "    - $apiAppName  (API service principal)" -ForegroundColor DarkGray
+    Write-Host "    - $authAppName (SWA auth app)" -ForegroundColor DarkGray
+
+    if ($isOurRg) {
+        Write-Host ""
+        Write-Host "  Resource group '$rgName' appears to be script-created (default name)." -ForegroundColor White
+        Write-Host "  It will be deleted along with everything inside it." -ForegroundColor White
+    } else {
+        Write-Host ""
+        Write-Warn "Resource group '$rgName' was not created by this script (or was specified with -ResourceGroup)."
+        Write-Warn "To avoid breaking other resources, only individual demo resources will be deleted:"
+        Write-Host "    - $funcAppName     (Functions app)" -ForegroundColor DarkGray
+        Write-Host "    - $swaName         (Static Web App)" -ForegroundColor DarkGray
+        Write-Host "    - $storageName     (Storage account)" -ForegroundColor DarkGray
+        Write-Host "    - $apiAppName      (API app registration)" -ForegroundColor DarkGray
+        Write-Host "    - $authAppName     (Auth app registration)" -ForegroundColor DarkGray
+        Write-Warn "VNet, subnets, private endpoints, and DNS zones will NOT be deleted."
+        Write-Warn "Clean those up manually if no longer needed."
     }
-    Write-Warn "This will delete Entra app registrations and the resource group '$rgName'."
+
+    Write-Host ""
     $confirm = Read-Host "Type 'yes' to confirm"
     if ($confirm -ne 'yes') { Write-Host "Aborted."; exit 0 }
 
+    # Delete app registrations (always safe)
     foreach ($appDisplayName in @($apiAppName, $authAppName)) {
         $apps = az ad app list --display-name $appDisplayName --query "[].appId" -o tsv 2>$null
         foreach ($appId in $apps) {
@@ -178,13 +202,62 @@ if ($Teardown) {
             az ad app delete --id $appId 2>$null
         }
     }
+    Write-OK "App registrations deleted."
 
-    $rgExists = az group exists --name $rgName -o tsv 2>$null
-    if ($rgExists -eq "true") {
-        az group delete --name $rgName --yes --no-wait 2>$null
-        Write-OK "Resource group deletion initiated (runs in background)."
+    if ($isOurRg) {
+        # Script-created RG — safe to delete the whole thing
+        $rgExists = az group exists --name $rgName -o tsv 2>$null
+        if ($rgExists -eq "true") {
+            az group delete --name $rgName --yes --no-wait 2>$null
+            Write-OK "Resource group '$rgName' deletion initiated (runs in background)."
+        } else {
+            Write-Warn "Resource group '$rgName' not found — nothing to delete."
+        }
     } else {
-        Write-Warn "Resource group '$rgName' not found — nothing to delete."
+        # User-owned RG — only delete individual resources we know we created
+        $rgExists = az group exists --name $rgName -o tsv 2>$null
+        if ($rgExists -eq "true") {
+            Write-Host "  Deleting individual demo resources from '$rgName'..."
+
+            # Functions app
+            $funcExists = az functionapp show --name $funcAppName --resource-group $rgName --query name -o tsv 2>$null
+            if ($funcExists) {
+                az functionapp delete --name $funcAppName --resource-group $rgName -o none 2>$null
+                Write-OK "Deleted Functions app '$funcAppName'."
+            }
+
+            # Static Web App
+            $swaExists = az staticwebapp show --name $swaName --resource-group $rgName --query name -o tsv 2>$null
+            if ($swaExists) {
+                az staticwebapp delete --name $swaName --resource-group $rgName --yes -o none 2>$null
+                Write-OK "Deleted Static Web App '$swaName'."
+            }
+
+            # Storage account
+            $storageExists = az storage account show --name $storageName --resource-group $rgName --query name -o tsv 2>$null
+            if ($storageExists) {
+                # Delete private endpoints first (they reference the storage account)
+                foreach ($subResource in @("blob", "table", "queue")) {
+                    $peName = "$storageName-$subResource-pe"
+                    $peExists = az network private-endpoint show --name $peName --resource-group $rgName --query name -o tsv 2>$null
+                    if ($peExists) {
+                        az network private-endpoint delete --name $peName --resource-group $rgName -o none 2>$null
+                        Write-OK "Deleted private endpoint '$peName'."
+                    }
+                }
+                az storage account delete --name $storageName --resource-group $rgName --yes -o none 2>$null
+                Write-OK "Deleted storage account '$storageName'."
+            }
+
+            # Warn about leftovers the user should review
+            Write-Host ""
+            Write-Warn "The following resources were left in place (review and remove manually if unneeded):"
+            Write-Host "    - VNet / subnet(s): may be shared with other workloads" -ForegroundColor DarkGray
+            Write-Host "    - Private DNS zones: may be used by other private endpoints" -ForegroundColor DarkGray
+            Write-Host "    - Application Insights: az monitor app-insights component delete ..." -ForegroundColor DarkGray
+        } else {
+            Write-Warn "Resource group '$rgName' not found — nothing to delete."
+        }
     }
 
     Write-OK "Teardown complete."
@@ -331,23 +404,69 @@ if ($usingExistingSubnet -and $funcSubnetId) {
     # Check 1 — Delegation
     $hasDelegation = $snInfo.delegations | Where-Object { $_.serviceName -eq 'Microsoft.App/environments' }
     if (-not $hasDelegation) {
-        Write-Err "Subnet must be delegated to Microsoft.App/environments (Flex Consumption requirement)."
-        Write-Err "Current delegations: $(($snInfo.delegations | ForEach-Object { $_.serviceName }) -join ', ')"
-        exit 1
+        $currentDelegations = ($snInfo.delegations | ForEach-Object { $_.serviceName }) -join ', '
+        if (-not $currentDelegations) { $currentDelegations = '(none)' }
+        Write-Warn "Subnet '$($snInfo.name)' is not delegated to Microsoft.App/environments."
+        Write-Host "    Current delegations: $currentDelegations" -ForegroundColor DarkGray
+        Write-Host ""
+        if ($snInfo.delegations -and $snInfo.delegations.Count -gt 0) {
+            # Has a DIFFERENT delegation — can't safely change this
+            Write-Err   "This subnet is delegated to another service. Changing delegation would"
+            Write-Err   "break existing resources using it. Please choose a different subnet or"
+            Write-Err   "create a new one (press N at the picker)."
+            Write-Host  "    To fix manually: remove the current delegation, then re-run this script." -ForegroundColor DarkGray
+            Write-Host  "    az network vnet subnet update --ids $funcSubnetId --remove delegations" -ForegroundColor DarkGray
+            exit 1
+        } else {
+            # No delegation at all — safe to add one (no existing service will break)
+            Write-Host  "  This subnet has no delegation. Flex Consumption requires" -ForegroundColor Yellow
+            Write-Host  "  delegation to Microsoft.App/environments." -ForegroundColor Yellow
+            Write-Host  "  We can add the delegation now (non-destructive, no existing" -ForegroundColor Yellow
+            Write-Host  "  resources will be affected)." -ForegroundColor Yellow
+            Write-Host ""
+            $fix = Read-Host "  Add delegation to Microsoft.App/environments? [Y/n]"
+            if ($fix -match '^[Nn]') {
+                Write-Host "  Aborted. To add delegation manually:" -ForegroundColor DarkGray
+                Write-Host "    az network vnet subnet update --ids $funcSubnetId --delegations Microsoft.App/environments" -ForegroundColor DarkGray
+                exit 1
+            }
+            az network vnet subnet update --ids $funcSubnetId `
+                --delegations "Microsoft.App/environments" -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Err "Failed to add delegation. You may not have permission on this subnet."
+                Write-Host "    Ask your network admin to run:" -ForegroundColor DarkGray
+                Write-Host "    az network vnet subnet update --ids $funcSubnetId --delegations Microsoft.App/environments" -ForegroundColor DarkGray
+                exit 1
+            }
+            Write-OK "Delegation added to Microsoft.App/environments."
+        }
+    } else {
+        Write-OK "Delegation: Microsoft.App/environments"
     }
-    Write-OK "Delegation: Microsoft.App/environments"
 
     # Check 2 — Minimum size /28 (16 addresses)
     $cidr = [int]($snInfo.addressPrefix -split '/')[1]
     if ($cidr -gt 28) {
-        Write-Err "Subnet CIDR is /$cidr — Flex Consumption requires at least /28 (16 addresses)."
+        Write-Err   "Subnet CIDR is /$cidr ($($snInfo.addressPrefix)) — Flex Consumption requires at least /28 (16 addresses)."
+        Write-Host  "" 
+        Write-Host  "  Resizing a subnet in-place is not supported by Azure — it requires" -ForegroundColor Yellow
+        Write-Host  "  deleting and recreating it, which would break any connected resources." -ForegroundColor Yellow
+        Write-Host  "  Options:" -ForegroundColor Yellow
+        Write-Host  "    1. Pick a different subnet with /28 or larger (press N to go back)" -ForegroundColor DarkGray
+        Write-Host  "    2. Create a new subnet in the same VNet:" -ForegroundColor DarkGray
+        Write-Host  "       az network vnet subnet create --name func-integration \" -ForegroundColor DarkGray
+        Write-Host  "         --resource-group $selectedVnetRg --vnet-name $selectedVnetName \" -ForegroundColor DarkGray
+        Write-Host  "         --address-prefix <CIDR /28 or larger> \" -ForegroundColor DarkGray
+        Write-Host  "         --delegations Microsoft.App/environments" -ForegroundColor DarkGray
+        Write-Host  "    3. Re-run this script and let it create a new VNet (press N at the subnet picker)" -ForegroundColor DarkGray
         exit 1
     }
     Write-OK "CIDR: $($snInfo.addressPrefix) (meets /28 minimum)"
 
     # Check 3 — Warn if subnet already has connected devices
     if ($snInfo.ipConfigurations -and $snInfo.ipConfigurations.Count -gt 0) {
-        Write-Warn "Subnet has $($snInfo.ipConfigurations.Count) existing IP configuration(s) — this is OK for shared subnets."
+        Write-Warn "Subnet has $($snInfo.ipConfigurations.Count) existing IP configuration(s)."
+        Write-Host  "    This is normal for shared subnets and won't cause issues." -ForegroundColor DarkGray
     }
 
     Write-OK "Using existing subnet: $($snInfo.name) ($($snInfo.addressPrefix))"
