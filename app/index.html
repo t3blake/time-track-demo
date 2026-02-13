@@ -56,6 +56,15 @@
     .badge-billable { background: #e8f5e9; color: #2e7d32; }
     .badge-non { background: #fff3e0; color: #e65100; }
 
+    .toggle-wrap { display: flex; align-items: center; gap: 0.6rem; padding-top: 0.25rem; height: 38px; }
+    .toggle { position: relative; width: 44px; height: 24px; flex-shrink: 0; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider { position: absolute; inset: 0; background: #cdd5de; border-radius: 999px; cursor: pointer; transition: background .2s; }
+    .toggle-slider::before { content: ''; position: absolute; left: 3px; top: 3px; width: 18px; height: 18px; background: #fff; border-radius: 50%; transition: transform .2s; }
+    .toggle input:checked + .toggle-slider { background: #0078d4; }
+    .toggle input:checked + .toggle-slider::before { transform: translateX(20px); }
+    .toggle-label { font-size: 0.85rem; color: #444; user-select: none; cursor: pointer; }
+
     .empty-state { text-align: center; padding: 2.5rem 1rem; color: #999; }
     .empty-state svg { width: 48px; height: 48px; fill: #ccc; margin-bottom: .5rem; }
 
@@ -128,11 +137,14 @@
           <input type="number" id="hours" min="0.25" max="24" step="0.25" placeholder="e.g. 2.5" required>
         </div>
         <div>
-          <label for="billable">Billable</label>
-          <select id="billable">
-            <option value="yes">Yes</option>
-            <option value="no">No</option>
-          </select>
+          <label>Billable</label>
+          <div class="toggle-wrap">
+            <label class="toggle">
+              <input type="checkbox" id="billable" checked>
+              <span class="toggle-slider"></span>
+            </label>
+            <span class="toggle-label" id="billableLabel">Yes</span>
+          </div>
         </div>
         <div class="full">
           <label for="notes">Notes <span style="font-weight:400;color:#999">(optional)</span></label>
@@ -184,6 +196,11 @@
     } catch (e) { /* ignore */ }
   })();
 
+  // --- Billable toggle label ---
+  const billableEl = document.getElementById('billable');
+  const billableLbl = document.getElementById('billableLabel');
+  billableEl.addEventListener('change', () => { billableLbl.textContent = billableEl.checked ? 'Yes' : 'No'; });
+
   // --- Load entries ---
   async function loadEntries() {
     try {
@@ -208,7 +225,7 @@
       project: document.getElementById('project').value,
       task: document.getElementById('task').value,
       hours: parseFloat(document.getElementById('hours').value),
-      billable: document.getElementById('billable').value === 'yes',
+      billable: document.getElementById('billable').checked,
       notes: document.getElementById('notes').value.trim()
     };
     try {
@@ -226,6 +243,7 @@
     }
     e.target.reset();
     document.getElementById('entryDate').valueAsDate = new Date();
+    billableLbl.textContent = 'Yes';
     cancelEdit();
     await loadEntries();
   });
@@ -286,7 +304,8 @@
     document.getElementById('project').value = e.project;
     document.getElementById('task').value = e.task;
     document.getElementById('hours').value = e.hours;
-    document.getElementById('billable').value = e.billable ? 'yes' : 'no';
+    document.getElementById('billable').checked = !!e.billable;
+    billableLbl.textContent = e.billable ? 'Yes' : 'No';
     document.getElementById('notes').value = e.notes || '';
     document.getElementById('formTitle').textContent = '\u270f\ufe0f Edit Time Entry';
     document.getElementById('submitBtn').textContent = 'Update Entry';
