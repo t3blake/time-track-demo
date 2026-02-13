@@ -11,6 +11,8 @@ app/staticwebapp.config.json
 # Deploy artifacts
 _api-deploy.zip
 _claims.json
+_link.json
+_redirect.json
 
 # Environment / secret files — never commit these
 .env

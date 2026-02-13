@@ -809,11 +809,30 @@ Write-Host "  Linking Functions app as backend..."
 $funcAppId = az functionapp show --name $funcAppName --resource-group $rgName --query id -o tsv
 $swaId = az staticwebapp show --name $swaName --resource-group $rgName --query id -o tsv
 
+# Write the body to a temp file to avoid shell escaping issues with az rest.
+$linkBody = @{ properties = @{ backendResourceId = $funcAppId; region = $Location } } | ConvertTo-Json -Compress
+$linkBodyFile = "$scriptDir\_link.json"
+$linkBody | Set-Content $linkBodyFile -Encoding UTF8
+
 az rest --method PUT `
     --url "$swaId/linkedBackends/${funcAppName}?api-version=2022-09-01" `
-    --body "{`"properties`":{`"backendResourceId`":`"$funcAppId`",`"region`":`"$Location`"}}" `
+    --body "@$linkBodyFile" `
     --headers "Content-Type=application/json" `
-    -o none 2>$null
+    -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+Remove-Item $linkBodyFile -ErrorAction SilentlyContinue
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Failed to link Functions app as SWA backend. See output above."
+    exit 1
+}
+
+# Verify the link was created
+$linkedBackends = az rest --method GET --url "$swaId/linkedBackends?api-version=2022-09-01" -o json 2>$null | ConvertFrom-Json
+if (-not $linkedBackends.value -or $linkedBackends.value.Count -eq 0) {
+    Write-Err "Linked backend was not created. The API will not be reachable from the SWA."
+    exit 1
+}
 Write-OK "Functions app linked as SWA backend."
 
 # ── 7. Entra ID Auth App Registration ────────────────────────────────────────
@@ -840,11 +859,15 @@ if (-not $SkipAuth) {
     }
 
     # Ensure redirect URI is set (idempotent — handles re-runs)
+    $redirectBody = @{ web = @{ redirectUris = @($aadCallbackUrl) } } | ConvertTo-Json -Compress
+    $redirectBodyFile = "$scriptDir\_redirect.json"
+    $redirectBody | Set-Content $redirectBodyFile -Encoding UTF8
     az rest --method PATCH `
         --url "https://graph.microsoft.com/v1.0/applications/$authObjectId" `
-        --body "{`"web`":{`"redirectUris`":[`"$aadCallbackUrl`"]}}" `
+        --body "@$redirectBodyFile" `
         --headers "Content-Type=application/json" `
         -o none 2>$null
+    Remove-Item $redirectBodyFile -ErrorAction SilentlyContinue
     Write-OK "Redirect URI configured."
 
     # Add openid + profile + email delegated permissions to Microsoft Graph
