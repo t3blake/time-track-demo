@@ -577,8 +577,9 @@ az storage account create `
     --min-tls-version TLS1_2 `
     --allow-blob-public-access false `
     --allow-shared-key-access false `
+    --default-action Deny `
     -o none
-Write-OK "Storage account '$storageName' created (shared-key auth disabled)."
+Write-OK "Storage account '$storageName' created (shared-key disabled, default-action Deny)."
 
 $storageId = az storage account show --name $storageName --resource-group $rgName --query id -o tsv
 
@@ -649,7 +650,8 @@ Write-Step "4/8  Creating Functions app (Flex Consumption with VNet integration)
 $storageUrl = "https://$storageName.table.core.windows.net"
 
 # $funcSubnetId is already resolved from the subnet picker in Step 2.
-# Create the Flex Consumption function app with VNet integration from the start.
+# Create the Flex Consumption function app with VNet integration, managed identity,
+# and identity-based deployment storage from the start.  --https-only enforces TLS.
 # WEBSITE_CONTENTOVERVNET routes deployment storage traffic through the VNet,
 # which is required because the storage account has public access disabled.
 az functionapp create `
@@ -661,6 +663,9 @@ az functionapp create `
     --runtime-version 20 `
     --functions-version 4 `
     --subnet $funcSubnetId `
+    --assign-identity [system] `
+    --deployment-storage-auth-type SystemAssignedIdentity `
+    --https-only true `
     -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
 
 if ($LASTEXITCODE -ne 0) {
@@ -675,19 +680,16 @@ if (-not $funcCheck) {
     exit 1
 }
 
-Write-OK "Functions app '$funcAppName' created with VNet integration."
+Write-OK "Functions app '$funcAppName' created (VNet + MI + HTTPS-only)."
 
-# Enable system-assigned managed identity for identity-based storage connections.
-# This is required because enterprise policy enforces allowSharedKeyAccess=false
-# on storage accounts, so the Functions runtime cannot use connection strings.
-Write-Host "  Enabling managed identity..."
-$miResult = az functionapp identity assign `
+# Retrieve the managed identity principal ID (enabled at creation via --assign-identity).
+# Enterprise policy enforces allowSharedKeyAccess=false on storage accounts,
+# so the Functions runtime must use identity-based connections.
+$miPrincipalId = az functionapp identity show `
     --name $funcAppName `
     --resource-group $rgName `
-    --identities [system] `
-    -o json 2>&1
-$miPrincipalId = ($miResult | ConvertFrom-Json).principalId
-Write-OK "Managed identity enabled (principal: $miPrincipalId)."
+    --query principalId -o tsv
+Write-OK "Managed identity principal: $miPrincipalId"
 
 # Assign storage RBAC roles to the managed identity.
 # The Functions runtime needs Blob/Queue access for internal operations
@@ -703,39 +705,14 @@ foreach ($role in @("Storage Blob Data Owner", "Storage Queue Data Contributor",
 }
 Write-OK "Storage RBAC roles assigned."
 
-# Switch from key-based to identity-based storage connections.
-# az functionapp create sets AzureWebJobsStorage and DEPLOYMENT_STORAGE_CONNECTION_STRING
-# using connection strings by default, but key auth is disabled on the storage account.
-Write-Host "  Switching to identity-based storage connections..."
+# Remove any legacy connection-string settings that az functionapp create may have set.
+# Deployment storage auth was already configured at creation (--deployment-storage-auth-type),
+# but the CLI may still add AzureWebJobsStorage or DEPLOYMENT_STORAGE_CONNECTION_STRING.
 az functionapp config appsettings delete `
     --name $funcAppName `
     --resource-group $rgName `
     --setting-names AzureWebJobsStorage DEPLOYMENT_STORAGE_CONNECTION_STRING `
     -o none 2>$null
-
-# Update the deployment storage to use SystemAssignedIdentity auth
-$funcId = az functionapp show --name $funcAppName --resource-group $rgName --query id -o tsv
-$deployContainer = az rest --method get --uri "${funcId}?api-version=2023-12-01" `
-    --query "properties.functionAppConfig.deployment.storage.value" -o tsv
-$patchFile = "$scriptDir\_deploypatch.json"
-@{
-    properties = @{
-        functionAppConfig = @{
-            deployment = @{
-                storage = @{
-                    type = "blobContainer"
-                    value = $deployContainer
-                    authentication = @{ type = "SystemAssignedIdentity" }
-                }
-            }
-            runtime = @{ name = "node"; version = "20" }
-            scaleAndConcurrency = @{ instanceMemoryMB = 2048; maximumInstanceCount = 100 }
-        }
-    }
-} | ConvertTo-Json -Depth 10 | Out-File $patchFile -Encoding utf8
-az rest --method patch --uri "${funcId}?api-version=2023-12-01" --body "@$patchFile" -o none 2>$null
-Remove-Item $patchFile -ErrorAction SilentlyContinue
-Write-OK "Deployment storage switched to managed identity auth."
 
 # Wait for RBAC propagation before deploying.
 # Azure RBAC assignments on storage can take 1-10 minutes to become effective.
