@@ -13,12 +13,12 @@ function getCred() {
 }
 
 // Validate that the caller authenticated through our Entra ID provider.
-// Accepts both 'entra' (custom OIDC) and 'aad' (built-in) providers.
+// The built-in AAD provider sets identityProvider to 'aad'.
 function validateAuth(req) {
   const header = req.headers["x-ms-client-principal"];
   if (!header) return false;
   const principal = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
-  return principal.identityProvider === "entra" || principal.identityProvider === "aad";
+  return principal.identityProvider === "aad";
 }
 
 module.exports = async function (context, req) {

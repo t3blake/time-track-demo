@@ -10,7 +10,7 @@ A lightweight time-tracking web app built on Azure Static Web Apps with Azure Ta
 
 - **Single-page time entry UI** — date, project, task, hours, billable flag, notes
 - **Persistent storage** — Azure Table Storage (no SQL database needed)
-- **Azure AD authentication** — custom OIDC provider with single-tenant Entra ID
+- **Azure AD authentication** — built-in AAD provider with single-tenant Entra ID
 - **Serverless API** — Azure Functions (managed by Static Web Apps)
 - **Zero infrastructure to manage** — all serverless, minimal cost
 <img width="895" height="983" alt="image" src="https://github.com/user-attachments/assets/04ef8600-d064-49dd-9aae-6af57a4adf11" />
@@ -24,7 +24,7 @@ flowchart TB
     end
 
     subgraph AAD["Microsoft Entra ID<br/>(Single-tenant)"]
-        Login["/.auth/login/entra<br/>Custom OIDC provider"]
+        Login["/.auth/login/aad<br/>Built-in AAD provider"]
     end
 
     subgraph AzureSub["Azure Subscription"]
@@ -44,13 +44,13 @@ flowchart TB
         end
 
         subgraph RBAC["Entra ID App Registrations"]
-            AuthApp["Auth App<br/>🔑 Client secret<br/>(custom OIDC provider)"]
+            AuthApp["Auth App<br/>(built-in AAD provider)"]
             SP["API Service Principal<br/>📜 Certificate credential<br/>Storage Table Data Contributor"]
         end
     end
 
     UI -- "HTTPS" --> Static
-    UI -. "/.auth/login/entra<br/>(302 redirect)" .-> Login
+    UI -. "/.auth/login/aad<br/>(302 redirect)" .-> Login
     Login -. "ID token + cookie" .-> Static
     Static -- "/api/*" --> Validate
     Validate -- "provider OK" --> GET & POST & DELETE
@@ -63,8 +63,8 @@ flowchart TB
 | Layer | Details |
 |-------|---------|
 | **Front-end** | Single HTML file served by SWA's global CDN. No build step. |
-| **Authentication** | Single-tenant Entra ID app registration. The deploy script tries the custom OIDC provider first (requires a client secret). If the tenant's credential policy blocks secrets, it automatically falls back to the built-in AAD provider (no secret needed). Optional claims are configured either way. |
-| **Auth validation** | Each API function checks the `x-ms-client-principal` header to confirm the user authenticated via an Entra ID provider (accepts both `entra` and `aad`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session. |
+| **Authentication** | Single-tenant Entra ID app registration using the built-in AAD provider. No client secret required — SWA handles token exchange internally. This avoids issues with enterprise Entra policies that block password credentials. Optional claims are configured to ensure SWA can identify the user. |
+| **Auth validation** | Each API function checks the `x-ms-client-principal` header to confirm the user authenticated via the built-in AAD provider (`identityProvider === "aad"`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session. |
 | **API** | Three Azure Functions (managed by SWA, Node 18). Routed automatically via `/api/*`. |
 | **Storage auth** | A service principal with the **Storage Table Data Contributor** RBAC role authenticates via `ClientCertificateCredential`. The deploy script generates a self-signed certificate — no password credentials needed (compliant with enterprise Entra policies). |
 | **Data** | Azure Table Storage — schema-less, pay-per-use, no database server to manage. |
@@ -99,8 +99,8 @@ az login
 The script prompts for a **prefix** (e.g. your alias) to generate unique Azure resource names. Then it will:
 1. Create a resource group, storage account, and Static Web App (Standard tier)
 2. Create a service principal with a certificate credential for Table Storage access
-3. Register an Entra ID auth app with client secret, API permissions, and optional claims
-4. Generate the SWA config with custom OIDC auth routes
+3. Register an Entra ID auth app with API permissions and optional claims
+4. Generate the SWA config with built-in AAD auth routes
 5. Configure all app settings and deploy the app + API
 
 At the end it prints the URL to open in your browser.
@@ -165,7 +165,7 @@ The `/.auth/*` route must appear **before** the `/*` catch-all in `staticwebapp.
 |-------|-----|
 | **Storage account has public access disabled** | The deploy script automatically enables public network access and verifies it. If Azure Policy blocks this, ask your admin for a policy exemption — SWA managed functions cannot use private endpoints. |
 | **TimeEntries table doesn't exist** | Re-run `deploy.ps1` — it creates the table via ARM at deploy time. |
-| **Missing app settings** | Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE`, `TABLE_STORAGE_URL`, `ENTRA_CLIENT_ID`, and `ENTRA_CLIENT_SECRET` are set on the SWA. |
+| **Missing app settings** | Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE`, `TABLE_STORAGE_URL`, and `AAD_CLIENT_ID` are set on the SWA. |
 | **Service principal certificate expired** | Re-run `deploy.ps1` — it generates a fresh 1-year certificate. |
 
 ### Checking API logs
@@ -176,12 +176,9 @@ az staticwebapp functions show --name <prefix>-demo --resource-group rg-<prefix>
 
 ## Security Notes
 
-- **Adaptive authentication**: The deploy script tries two auth approaches in order:
-  1. **Custom OIDC provider** (`/.auth/login/entra`) — uses a client secret created via Graph API. This is the preferred approach.
-  2. **Built-in AAD provider** (`/.auth/login/aad`) — used as a fallback when the tenant has an app credential policy that blocks password credentials. No client secret required.
-  Both providers use a single-tenant Entra ID app registration with optional claims.
+- **Built-in AAD provider**: Uses the SWA built-in `azureActiveDirectory` identity provider (`/.auth/login/aad`). No client secret is required — SWA handles the token exchange internally. This avoids issues with enterprise Entra policies that block password credentials on app registrations.
 - **Optional claims**: The auth app is configured with optional ID token claims (`email`, `preferred_username`, `upn`) to ensure SWA can identify the user. Without these, SWA returns a 403 `invalidUserInfo` or enters a redirect loop.
-- **API-level auth validation**: For defense in depth, every API function checks the `x-ms-client-principal` header to confirm the user authenticated via an Entra ID provider (accepts both `identityProvider === "entra"` and `"aad"`). Since both providers are configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session.
+- **API-level auth validation**: For defense in depth, every API function checks the `x-ms-client-principal` header to confirm the user authenticated via the built-in AAD provider (`identityProvider === "aad"`). Since the provider is configured with a single-tenant issuer URL, only users from the expected tenant can obtain a valid session.
 - **Certificate-based storage auth**: The API uses `ClientCertificateCredential` with a deploy-time generated self-signed certificate (1-year expiry). The PEM is stored as a base64-encoded app setting (encrypted at rest). No password credentials are created for the API service principal.
 - **Why not managed identity?** SWA managed functions do not expose `IDENTITY_HEADER` or the MSI endpoint to user code. `DefaultAzureCredential` fails entirely. This is a [known platform limitation](https://learn.microsoft.com/en-us/azure/static-web-apps/apis-functions).
 - **Storage network access**: The storage account uses public network access. To fully lock it down, you'd need to replace SWA managed functions with a linked Azure Functions app that supports VNet integration and private endpoints.

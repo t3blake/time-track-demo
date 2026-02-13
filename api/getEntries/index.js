@@ -13,14 +13,14 @@ function getCred() {
 }
 
 // Validate that the caller authenticated through our Entra ID provider.
-// Accepts both the custom OIDC provider ('entra') and the built-in AAD
-// provider ('aad'). Both are configured with a single-tenant issuer URL,
-// so only users from the expected tenant can obtain a valid session.
+// The built-in AAD provider sets identityProvider to 'aad'. Since the
+// provider is configured with a single-tenant issuer URL, only users
+// from the expected tenant can obtain a valid session.
 function validateAuth(req) {
   const header = req.headers["x-ms-client-principal"];
   if (!header) return false;
   const principal = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
-  return principal.identityProvider === "entra" || principal.identityProvider === "aad";
+  return principal.identityProvider === "aad";
 }
 
 module.exports = async function (context, req) {

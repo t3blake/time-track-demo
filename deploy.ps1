@@ -1,7 +1,7 @@
 # Time Entry Demo - Automated Deployment Script
 # Deploys a complete time entry web app to Azure Static Web Apps with:
 #   - Azure Table Storage for persistence
-#   - Entra ID authentication (adaptive: custom OIDC or built-in AAD)
+#   - Entra ID authentication (built-in AAD provider, single-tenant)
 #   - Azure Functions API backend
 #   - Certificate-based service principal auth for Table Storage
 #
@@ -340,9 +340,7 @@ Write-OK "URL: $swaUrl"
 if (-not $SkipAuth) {
     Write-Step "5/8  Creating Entra ID auth app registration..."
 
-    # Determine callback URLs for both provider types upfront
-    $entraCallbackUrl = "$swaUrl/.auth/login/entra/callback"
-    $aadCallbackUrl   = "$swaUrl/.auth/login/aad/callback"
+    $aadCallbackUrl = "$swaUrl/.auth/login/aad/callback"
 
     $existingAuthApp = az ad app list --display-name $authAppName --query "[0].{appId:appId, id:id}" -o json 2>$null | ConvertFrom-Json
     if ($existingAuthApp) {
@@ -350,50 +348,23 @@ if (-not $SkipAuth) {
         $authObjectId  = $existingAuthApp.id
         Write-Host "  Using existing auth app: $authAppId"
     } else {
-        # Register with both redirect URIs so the app works with either provider type
         $authApp = az ad app create `
             --display-name $authAppName `
             --sign-in-audience AzureADMyOrg `
-            --web-redirect-uris $entraCallbackUrl $aadCallbackUrl `
+            --web-redirect-uris $aadCallbackUrl `
             -o json | ConvertFrom-Json
         $authAppId    = $authApp.appId
         $authObjectId = $authApp.id
         Write-OK "Auth app created: $authAppId"
     }
 
-    # Ensure redirect URIs include both callback paths (idempotent)
+    # Ensure redirect URI is set (idempotent — handles re-runs)
     az rest --method PATCH `
         --url "https://graph.microsoft.com/v1.0/applications/$authObjectId" `
-        --body "{`"web`":{`"redirectUris`":[`"$entraCallbackUrl`",`"$aadCallbackUrl`"]}}" `
+        --body "{`"web`":{`"redirectUris`":[`"$aadCallbackUrl`"]}}" `
         --headers "Content-Type=application/json" `
         -o none 2>$null
-    Write-OK "Redirect URIs configured."
-
-    # Try creating a client secret for the custom OIDC provider.
-    # If the tenant has an app credential policy that blocks password credentials,
-    # we fall back to the built-in AAD provider which doesn't require a secret.
-    $useCustomOidc = $true
-    $authSecret = $null
-
-    $secretBody = '{\"passwordCredential\":{\"displayName\":\"SWA Auth\",\"endDateTime\":\"' + (Get-Date).AddYears(1).ToString('yyyy-MM-ddTHH:mm:ssZ') + '\"}}'
-    $secretRaw = az rest --method POST `
-        --url "https://graph.microsoft.com/v1.0/applications/$authObjectId/addPassword" `
-        --body $secretBody `
-        --headers "Content-Type=application/json" `
-        -o json 2>&1
-
-    if ($LASTEXITCODE -eq 0) {
-        $secretResult = $secretRaw | ConvertFrom-Json
-        $authSecret = $secretResult.secretText
-        Write-OK "Client secret created (custom OIDC provider)."
-    } elseif ("$secretRaw" -match "CredentialTypeNotAllowedAsPerAppPolicy") {
-        $useCustomOidc = $false
-        Write-Warn "Tenant policy blocks client secrets on app registrations."
-        Write-Warn "Using built-in Microsoft identity provider instead (no secret required)."
-    } else {
-        Write-Err "Failed to create client secret: $secretRaw"
-        exit 1
-    }
+    Write-OK "Redirect URI configured."
 
     # Add openid + profile + email delegated permissions to Microsoft Graph
     # and configure optional claims so the ID token includes email/upn.
@@ -455,74 +426,32 @@ if (-not $SkipAuth) {
     # Route order matters! The /.auth/* route MUST appear before the /* catch-all
     # to prevent an infinite redirect loop.
 
-    if ($useCustomOidc) {
-        # Custom OpenID Connect provider named 'entra' backed by Entra ID.
-        # Requires a client secret (created in step 5).
-        $loginRoute = "/.auth/login/entra"
-        $swaConfig = @{
-            auth = @{
-                identityProviders = @{
-                    customOpenIdConnectProviders = @{
-                        entra = @{
-                            registration = @{
-                                clientIdSettingName = "ENTRA_CLIENT_ID"
-                                clientCredential = @{
-                                    clientSecretSettingName = "ENTRA_CLIENT_SECRET"
-                                }
-                                openIdConnectConfiguration = @{
-                                    wellKnownOpenIdConfiguration = "https://login.microsoftonline.com/$tenantId/v2.0/.well-known/openid-configuration"
-                                }
-                            }
-                            login = @{
-                                nameClaimType = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"
-                                scopes = @("openid", "profile", "email")
-                            }
-                        }
+    # Built-in Microsoft identity provider (azureActiveDirectory).
+    # No client secret required — SWA handles token exchange internally.
+    # This avoids issues with enterprise Entra policies that block password credentials.
+    $loginRoute = "/.auth/login/aad"
+    $swaConfig = @{
+        auth = @{
+            identityProviders = @{
+                azureActiveDirectory = @{
+                    registration = @{
+                        openIdIssuer = "https://login.microsoftonline.com/$tenantId/v2.0"
+                        clientIdSettingName = "AAD_CLIENT_ID"
                     }
                 }
             }
-            routes = @(
-                @{ route = "/.auth/login/github";  statusCode = 404 }
-                @{ route = "/.auth/login/twitter"; statusCode = 404 }
-                @{ route = "/.auth/login/aad";     statusCode = 404 }
-                @{ route = "/.auth/*"; allowedRoles = @("anonymous", "authenticated") }
-                @{ route = "/*";       allowedRoles = @("authenticated") }
-            )
-            responseOverrides = @{
-                "401" = @{ redirect = $loginRoute; statusCode = 302 }
-            }
-            navigationFallback = @{ rewrite = "/index.html"; exclude = @("/api/*") }
-            platform = @{ apiRuntime = "node:18" }
         }
-    } else {
-        # Built-in Microsoft identity provider (azureActiveDirectory).
-        # Used when the tenant policy blocks client secrets.
-        # No secret required — SWA handles token exchange internally.
-        $loginRoute = "/.auth/login/aad"
-        $swaConfig = @{
-            auth = @{
-                identityProviders = @{
-                    azureActiveDirectory = @{
-                        registration = @{
-                            openIdIssuer = "https://login.microsoftonline.com/$tenantId/v2.0"
-                            clientIdSettingName = "AAD_CLIENT_ID"
-                        }
-                    }
-                }
-            }
-            routes = @(
-                @{ route = "/.auth/login/github";  statusCode = 404 }
-                @{ route = "/.auth/login/twitter"; statusCode = 404 }
-                @{ route = "/.auth/login/entra";   statusCode = 404 }
-                @{ route = "/.auth/*"; allowedRoles = @("anonymous", "authenticated") }
-                @{ route = "/*";       allowedRoles = @("authenticated") }
-            )
-            responseOverrides = @{
-                "401" = @{ redirect = $loginRoute; statusCode = 302 }
-            }
-            navigationFallback = @{ rewrite = "/index.html"; exclude = @("/api/*") }
-            platform = @{ apiRuntime = "node:18" }
+        routes = @(
+            @{ route = "/.auth/login/github";  statusCode = 404 }
+            @{ route = "/.auth/login/twitter"; statusCode = 404 }
+            @{ route = "/.auth/*"; allowedRoles = @("anonymous", "authenticated") }
+            @{ route = "/*";       allowedRoles = @("authenticated") }
+        )
+        responseOverrides = @{
+            "401" = @{ redirect = $loginRoute; statusCode = 302 }
         }
+        navigationFallback = @{ rewrite = "/index.html"; exclude = @("/api/*") }
+        platform = @{ apiRuntime = "node:18" }
     }
 } else {
     $swaConfig = @{
@@ -545,12 +474,7 @@ $settings = @(
     "TABLE_STORAGE_URL=$storageUrl"
 )
 if (-not $SkipAuth) {
-    if ($useCustomOidc) {
-        $settings += "ENTRA_CLIENT_ID=$authAppId"
-        $settings += "ENTRA_CLIENT_SECRET=$authSecret"
-    } else {
-        $settings += "AAD_CLIENT_ID=$authAppId"
-    }
+    $settings += "AAD_CLIENT_ID=$authAppId"
 }
 
 az staticwebapp appsettings set `
@@ -641,8 +565,7 @@ Write-Host "  📦 Resource Group: $rgName"        -ForegroundColor White
 Write-Host "  📊 Storage:        $storageName"   -ForegroundColor White
 Write-Host "  🔑 API SP:         $apiAppName"    -ForegroundColor White
 if (-not $SkipAuth) {
-    $authMethod = if ($useCustomOidc) { "custom OIDC" } else { "built-in AAD" }
-    Write-Host "  🔒 Auth:          Entra ID ($authMethod, tenant $tenantId)" -ForegroundColor White
+    Write-Host "  🔒 Auth:          Entra ID (built-in AAD, tenant $tenantId)" -ForegroundColor White
     Write-Host "  🆔 Auth App:       $authAppName ($authAppId)" -ForegroundColor White
 }
 Write-Host ""
