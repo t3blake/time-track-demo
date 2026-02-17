@@ -458,13 +458,6 @@ if ($usingExistingSubnet -and $funcSubnetId) {
         exit 1
     }
     Write-OK "CIDR: $($snInfo.addressPrefix) (meets /28 minimum)"
-
-    # Check 3 — Warn if subnet already has connected devices
-    if ($snInfo.ipConfigurations -and $snInfo.ipConfigurations.Count -gt 0) {
-        Write-Warn "Subnet has $($snInfo.ipConfigurations.Count) existing IP configuration(s)."
-        Write-Host  "    This is normal for shared subnets and won't cause issues." -ForegroundColor DarkGray
-    }
-
     Write-OK "Using existing subnet: $($snInfo.name) ($($snInfo.addressPrefix))"
 
     # Look for a companion "private-endpoints" subnet in the same VNet,
