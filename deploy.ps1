@@ -649,6 +649,7 @@ az functionapp create `
     --runtime-version 20 `
     --functions-version 4 `
     --subnet $funcSubnetId `
+    --vnet $vnetResourceId `
     --assign-identity [system] `
     --deployment-storage-auth-type SystemAssignedIdentity `
     --https-only true `
