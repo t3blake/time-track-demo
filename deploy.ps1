@@ -571,6 +571,7 @@ az storage account create `
     --allow-blob-public-access false `
     --allow-shared-key-access false `
     --default-action Deny `
+    --public-network-access Disabled `
     -o none
 Write-OK "Storage account '$storageName' created (shared-key disabled, default-action Deny)."
 
@@ -619,14 +620,6 @@ foreach ($subResource in @("blob", "table", "queue")) {
         -o none 2>$null
 }
 Write-OK "Private endpoints and DNS zones configured (blob, table, queue)."
-
-# Ensure public network access is disabled (enterprise policy should enforce
-# this, but we set it explicitly for correctness).
-az storage account update `
-    --name $storageName `
-    --resource-group $rgName `
-    --public-network-access Disabled `
-    -o none 2>$null
 
 # Create the TimeEntries table via ARM management plane.
 # ARM operations use the management endpoint (management.azure.com), not the
