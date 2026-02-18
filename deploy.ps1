@@ -635,39 +635,44 @@ Write-Step "4/8  Creating Functions app (Flex Consumption with VNet integration)
 
 $storageUrl = "https://$storageName.table.core.windows.net"
 
-# $funcSubnetId is already resolved from the subnet picker in Step 2.
-# Create the Flex Consumption function app with VNet integration, managed identity,
-# and identity-based deployment storage from the start.  --https-only enforces TLS.
-# WEBSITE_CONTENTOVERVNET routes deployment storage traffic through the VNet,
-# which is required because the storage account has public access disabled.
-az functionapp create `
-    --name $funcAppName `
-    --resource-group $rgName `
-    --storage-account $storageName `
-    --flexconsumption-location $Location `
-    --runtime node `
-    --runtime-version 20 `
-    --functions-version 4 `
-    --subnet $funcSubnetId `
-    --vnet $vnetResourceId `
-    --assign-identity [system] `
-    --deployment-storage-auth-type SystemAssignedIdentity `
-    --https-only true `
-    -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+# check if the function app already exists (could be from a previous failed deployment attempt)
+$funcCheck = az functionapp show --name $funcAppName --resource-group $rgName
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Err "Failed to create Functions app. See output above."
-    exit 1
+if ( -not $funcCheck) {
+    # $funcSubnetId is already resolved from the subnet picker in Step 2.
+    # Create the Flex Consumption function app with VNet integration, managed identity,
+    # and identity-based deployment storage from the start.  --https-only enforces TLS.
+    # WEBSITE_CONTENTOVERVNET routes deployment storage traffic through the VNet,
+    # which is required because the storage account has public access disabled.
+    az functionapp create `
+        --name $funcAppName `
+        --resource-group $rgName `
+        --storage-account $storageName `
+        --flexconsumption-location $Location `
+        --runtime node `
+        --runtime-version 20 `
+        --functions-version 4 `
+        --subnet $funcSubnetId `
+        --vnet $vnetResourceId `
+        --assign-identity [system] `
+        --deployment-storage-auth-type SystemAssignedIdentity `
+        --https-only true `
+        -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to create Functions app. See output above."
+        exit 1
+    }
+    
+    # Verify the app was actually created
+    $funcCheck = az functionapp show --name $funcAppName --resource-group $rgName --query name -o tsv 2>$null
+    if (-not $funcCheck) {
+        Write-Err "Functions app '$funcAppName' was not created. Check that the Microsoft.App provider is registered and VNet/subnet are correct."
+        exit 1
+    }
+    
+    Write-OK "Functions app '$funcAppName' created (VNet + MI + HTTPS-only)."
 }
-
-# Verify the app was actually created
-$funcCheck = az functionapp show --name $funcAppName --resource-group $rgName --query name -o tsv 2>$null
-if (-not $funcCheck) {
-    Write-Err "Functions app '$funcAppName' was not created. Check that the Microsoft.App provider is registered and VNet/subnet are correct."
-    exit 1
-}
-
-Write-OK "Functions app '$funcAppName' created (VNet + MI + HTTPS-only)."
 
 # Retrieve the managed identity principal ID (enabled at creation via --assign-identity).
 # Enterprise policy enforces allowSharedKeyAccess=false on storage accounts,
