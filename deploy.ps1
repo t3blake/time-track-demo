@@ -103,7 +103,7 @@ function Show-NumberedPicker {
 
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║          Time Entry Demo - Deployment Script            ║" -ForegroundColor Cyan
+Write-Host "║          Time Entry Demo - Deployment Script             ║" -ForegroundColor Cyan
 Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
 # ── Prompt for prefix if not provided ────────────────────────────────────────
@@ -1034,7 +1034,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║                  Deployment Complete!                   ║" -ForegroundColor Green
+Write-Host "║                  Deployment Complete!                    ║" -ForegroundColor Green
 Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 Write-Host "  🌐 App URL:        $swaUrl"       -ForegroundColor White
