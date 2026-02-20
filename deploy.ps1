@@ -511,7 +511,11 @@ if (-not $usingExistingSubnet) {
         --resource-group $rgName `
         --location $Location `
         --address-prefix "10.0.0.0/16" `
-        -o none 2>$null
+        -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to create VNet '$vnetName'."
+        exit 1
+    }
 
     # Subnet for Functions VNet integration (delegated to Microsoft.App/environments
     # because Flex Consumption runs on Container Apps infrastructure).
@@ -521,7 +525,11 @@ if (-not $usingExistingSubnet) {
         --vnet-name $vnetName `
         --address-prefix "10.0.0.0/24" `
         --delegations "Microsoft.App/environments" `
-        -o none 2>$null
+        -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to create 'func-integration' subnet."
+        exit 1
+    }
 
     # Subnet for private endpoints (no delegation needed)
     az network vnet subnet create `
@@ -529,7 +537,11 @@ if (-not $usingExistingSubnet) {
         --resource-group $rgName `
         --vnet-name $vnetName `
         --address-prefix "10.0.1.0/24" `
-        -o none 2>$null
+        -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to create 'private-endpoints' subnet."
+        exit 1
+    }
 
     Write-OK "VNet '$vnetName' created with func-integration and private-endpoints subnets."
 
@@ -586,6 +598,13 @@ $storageId = az storage account show --name $storageName --resource-group $rgNam
 # Private endpoints for blob (Functions deployment storage) and table (app data)
 # $peSubnetId and $vnetName are already resolved from the subnet picker in Step 2.
 
+# Resolve the VNet resource ID once (needed for DNS zone VNet links)
+$vnetResourceId = az network vnet show --name $vnetName --resource-group $vnetRg --query id -o tsv
+if ($LASTEXITCODE -ne 0 -or -not $vnetResourceId) {
+    Write-Err "Failed to resolve VNet resource ID for '$vnetName' in resource group '$vnetRg'."
+    exit 1
+}
+
 foreach ($subResource in @("blob", "table", "queue")) {
     $peName = "$storageName-$subResource-pe"
     Write-Host "  Creating private endpoint: $peName ($subResource)..."
@@ -597,24 +616,49 @@ foreach ($subResource in @("blob", "table", "queue")) {
         --private-connection-resource-id $storageId `
         --group-id $subResource `
         --connection-name "$storageName-$subResource" `
-        -o none 2>$null
+        -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to create private endpoint '$peName'."
+        exit 1
+    }
 
     # Private DNS zone for this sub-resource
     $dnsZone = "privatelink.$subResource.core.windows.net"
-    az network private-dns zone create `
-        --name $dnsZone `
-        --resource-group $rgName `
-        -o none 2>$null
+    $dnsZoneExists = az network private-dns zone show --name $dnsZone --resource-group $rgName --query id -o tsv 2>$null
+    if (-not $dnsZoneExists) {
+        az network private-dns zone create `
+            --name $dnsZone `
+            --resource-group $rgName `
+            -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Failed to create private DNS zone '$dnsZone'."
+            exit 1
+        }
+    }
 
     # Link DNS zone to our VNet so VNet-integrated apps resolve private IPs
-    $vnetResourceId = az network vnet show --name $vnetName --resource-group $vnetRg --query id -o tsv 2>$null
-    az network private-dns zone vnet-link create `
+    $linkExists = az network private-dns link vnet show `
         --name "$vnetName-$subResource-link" `
         --resource-group $rgName `
         --zone-name $dnsZone `
-        --virtual-network $vnetResourceId `
-        --registration-enabled false `
-        -o none 2>$null
+        --query id -o tsv 2>$null
+    if (-not $linkExists) {
+        Write-Host "    Creating VNet link: $vnetName-$subResource-link..."
+        az network private-dns link vnet create `
+            --name "$vnetName-$subResource-link" `
+            --resource-group $rgName `
+            --zone-name $dnsZone `
+            --virtual-network $vnetResourceId `
+            --registration-enabled false `
+            -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Failed to create VNet link '$vnetName-$subResource-link' for DNS zone '$dnsZone'."
+            Write-Err "VNet resource ID: $vnetResourceId"
+            exit 1
+        }
+    } else {
+        Write-Host "    VNet link '$vnetName-$subResource-link' already exists."
+    }
 
     # Create DNS records for the private endpoint
     az network private-endpoint dns-zone-group create `
@@ -623,7 +667,11 @@ foreach ($subResource in @("blob", "table", "queue")) {
         --endpoint-name $peName `
         --private-dns-zone $dnsZone `
         --zone-name $subResource `
-        -o none 2>$null
+        -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to create DNS zone group for endpoint '$peName'."
+        exit 1
+    }
 }
 Write-OK "Private endpoints and DNS zones configured (blob, table, queue)."
 
@@ -633,14 +681,22 @@ az storage account update `
     --name $storageName `
     --resource-group $rgName `
     --public-network-access Disabled `
-    -o none 2>$null
+    -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Failed to disable public network access on storage account '$storageName'."
+    exit 1
+}
 
 # Create the TimeEntries table via ARM management plane.
 # ARM operations use the management endpoint (management.azure.com), not the
 # storage data plane, so they work regardless of network restrictions.
 az rest --method PUT `
     --url "/subscriptions/$subId/resourceGroups/$rgName/providers/Microsoft.Storage/storageAccounts/$storageName/tableServices/default/tables/TimeEntries?api-version=2023-01-01" `
-    --body '{}' -o none 2>$null
+    --body '{}' -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Failed to create TimeEntries table."
+    exit 1
+}
 Write-OK "TimeEntries table created."
 
 # ── 4. Azure Functions App (Flex Consumption) ────────────────────────────────
