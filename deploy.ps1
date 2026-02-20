@@ -345,7 +345,7 @@ if (-not $SubnetId) {
     # Discover subnets in the current subscription that already have the required
     # delegation.  This lets users who have a centrally-managed VNet reuse it.
     Write-Host "  Scanning for subnets delegated to Microsoft.App/environments..."
-    $allSubnets = az network vnet list --query "[].{vnet:name, rg:resourceGroup, subnets:subnets}" -o json 2>$null | ConvertFrom-Json
+    $allSubnets = az network vnet list --resource-group $rgName --query "[].{vnet:name, rg:resourceGroup, subnets:subnets}" -o json 2>$null | ConvertFrom-Json
 
     $candidates = @()
     foreach ($vnet in $allSubnets) {
