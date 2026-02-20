@@ -580,6 +580,8 @@ $storageId = az storage account show --name $storageName --resource-group $rgNam
 # Private endpoints for blob (Functions deployment storage) and table (app data)
 # $peSubnetId and $vnetName are already resolved from the subnet picker in Step 2.
 
+$vnetResourceId = az network vnet show --name $vnetName --resource-group $vnetRg --query id -o tsv 2>$null
+
 foreach ($subResource in @("blob", "table", "queue")) {
     $peName = "$storageName-$subResource-pe"
     Write-Host "  Creating private endpoint: $peName ($subResource)..."
@@ -593,6 +595,11 @@ foreach ($subResource in @("blob", "table", "queue")) {
         --connection-name "$storageName-$subResource" `
         -o none 2>$null
 
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to create Private Endpoint for $subResource. See output above."
+        exit 1
+    }
+
     # Private DNS zone for this sub-resource
     $dnsZone = "privatelink.$subResource.core.windows.net"
     az network private-dns zone create `
@@ -601,8 +608,7 @@ foreach ($subResource in @("blob", "table", "queue")) {
         -o none 2>$null
 
     # Link DNS zone to our VNet so VNet-integrated apps resolve private IPs
-    $vnetResourceId = az network vnet show --name $vnetName --resource-group $vnetRg --query id -o tsv 2>$null
-    az network private-dns zone vnet-link create `
+    az network private-dns link vnet create `
         --name "$vnetName-$subResource-link" `
         --resource-group $rgName `
         --zone-name $dnsZone `
