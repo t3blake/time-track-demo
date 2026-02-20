@@ -103,7 +103,7 @@ function Show-NumberedPicker {
 
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║          Time Entry Demo - Deployment Script            ║" -ForegroundColor Cyan
+Write-Host "║          Time Entry Demo - Deployment Script             ║" -ForegroundColor Cyan
 Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
 # ── Prompt for prefix if not provided ────────────────────────────────────────
@@ -345,7 +345,7 @@ if (-not $SubnetId) {
     # Discover subnets in the current subscription that already have the required
     # delegation.  This lets users who have a centrally-managed VNet reuse it.
     Write-Host "  Scanning for subnets delegated to Microsoft.App/environments..."
-    $allSubnets = az network vnet list --query "[].{vnet:name, rg:resourceGroup, subnets:subnets}" -o json 2>$null | ConvertFrom-Json
+    $allSubnets = az network vnet list --resource-group $rgName --query "[].{vnet:name, rg:resourceGroup, subnets:subnets}" -o json 2>$null | ConvertFrom-Json
 
     $candidates = @()
     foreach ($vnet in $allSubnets) {
@@ -458,13 +458,6 @@ if ($usingExistingSubnet -and $funcSubnetId) {
         exit 1
     }
     Write-OK "CIDR: $($snInfo.addressPrefix) (meets /28 minimum)"
-
-    # Check 3 — Warn if subnet already has connected devices
-    if ($snInfo.ipConfigurations -and $snInfo.ipConfigurations.Count -gt 0) {
-        Write-Warn "Subnet has $($snInfo.ipConfigurations.Count) existing IP configuration(s)."
-        Write-Host  "    This is normal for shared subnets and won't cause issues." -ForegroundColor DarkGray
-    }
-
     Write-OK "Using existing subnet: $($snInfo.name) ($($snInfo.addressPrefix))"
 
     # Look for a companion "private-endpoints" subnet in the same VNet,
@@ -578,6 +571,7 @@ az storage account create `
     --allow-blob-public-access false `
     --allow-shared-key-access false `
     --default-action Deny `
+    --public-network-access Disabled `
     -o none
 Write-OK "Storage account '$storageName' created (shared-key disabled, default-action Deny)."
 
@@ -585,6 +579,8 @@ $storageId = az storage account show --name $storageName --resource-group $rgNam
 
 # Private endpoints for blob (Functions deployment storage) and table (app data)
 # $peSubnetId and $vnetName are already resolved from the subnet picker in Step 2.
+
+$vnetResourceId = az network vnet show --name $vnetName --resource-group $vnetRg --query id -o tsv 2>$null
 
 foreach ($subResource in @("blob", "table", "queue")) {
     $peName = "$storageName-$subResource-pe"
@@ -599,6 +595,11 @@ foreach ($subResource in @("blob", "table", "queue")) {
         --connection-name "$storageName-$subResource" `
         -o none 2>$null
 
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to create Private Endpoint for $subResource. See output above."
+        exit 1
+    }
+
     # Private DNS zone for this sub-resource
     $dnsZone = "privatelink.$subResource.core.windows.net"
     az network private-dns zone create `
@@ -607,8 +608,7 @@ foreach ($subResource in @("blob", "table", "queue")) {
         -o none 2>$null
 
     # Link DNS zone to our VNet so VNet-integrated apps resolve private IPs
-    $vnetResourceId = az network vnet show --name $vnetName --resource-group $vnetRg --query id -o tsv 2>$null
-    az network private-dns zone vnet-link create `
+    az network private-dns link vnet create `
         --name "$vnetName-$subResource-link" `
         --resource-group $rgName `
         --zone-name $dnsZone `
@@ -627,14 +627,6 @@ foreach ($subResource in @("blob", "table", "queue")) {
 }
 Write-OK "Private endpoints and DNS zones configured (blob, table, queue)."
 
-# Ensure public network access is disabled (enterprise policy should enforce
-# this, but we set it explicitly for correctness).
-az storage account update `
-    --name $storageName `
-    --resource-group $rgName `
-    --public-network-access Disabled `
-    -o none 2>$null
-
 # Create the TimeEntries table via ARM management plane.
 # ARM operations use the management endpoint (management.azure.com), not the
 # storage data plane, so they work regardless of network restrictions.
@@ -649,38 +641,44 @@ Write-Step "4/8  Creating Functions app (Flex Consumption with VNet integration)
 
 $storageUrl = "https://$storageName.table.core.windows.net"
 
-# $funcSubnetId is already resolved from the subnet picker in Step 2.
-# Create the Flex Consumption function app with VNet integration, managed identity,
-# and identity-based deployment storage from the start.  --https-only enforces TLS.
-# WEBSITE_CONTENTOVERVNET routes deployment storage traffic through the VNet,
-# which is required because the storage account has public access disabled.
-az functionapp create `
-    --name $funcAppName `
-    --resource-group $rgName `
-    --storage-account $storageName `
-    --flexconsumption-location $Location `
-    --runtime node `
-    --runtime-version 20 `
-    --functions-version 4 `
-    --subnet $funcSubnetId `
-    --assign-identity [system] `
-    --deployment-storage-auth-type SystemAssignedIdentity `
-    --https-only true `
-    -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+# check if the function app already exists (could be from a previous failed deployment attempt)
+$funcCheck = az functionapp show --name $funcAppName --resource-group $rgName
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Err "Failed to create Functions app. See output above."
-    exit 1
+if ( -not $funcCheck) {
+    # $funcSubnetId is already resolved from the subnet picker in Step 2.
+    # Create the Flex Consumption function app with VNet integration, managed identity,
+    # and identity-based deployment storage from the start.  --https-only enforces TLS.
+    # WEBSITE_CONTENTOVERVNET routes deployment storage traffic through the VNet,
+    # which is required because the storage account has public access disabled.
+    az functionapp create `
+        --name $funcAppName `
+        --resource-group $rgName `
+        --storage-account $storageName `
+        --flexconsumption-location $Location `
+        --runtime node `
+        --runtime-version 20 `
+        --functions-version 4 `
+        --subnet $funcSubnetId `
+        --vnet $vnetResourceId `
+        --assign-identity [system] `
+        --deployment-storage-auth-type SystemAssignedIdentity `
+        --https-only true `
+        -o none 2>&1 | ForEach-Object { Write-Host "    $_" }
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to create Functions app. See output above."
+        exit 1
+    }
+    
+    # Verify the app was actually created
+    $funcCheck = az functionapp show --name $funcAppName --resource-group $rgName --query name -o tsv 2>$null
+    if (-not $funcCheck) {
+        Write-Err "Functions app '$funcAppName' was not created. Check that the Microsoft.App provider is registered and VNet/subnet are correct."
+        exit 1
+    }
+    
+    Write-OK "Functions app '$funcAppName' created (VNet + MI + HTTPS-only)."
 }
-
-# Verify the app was actually created
-$funcCheck = az functionapp show --name $funcAppName --resource-group $rgName --query name -o tsv 2>$null
-if (-not $funcCheck) {
-    Write-Err "Functions app '$funcAppName' was not created. Check that the Microsoft.App provider is registered and VNet/subnet are correct."
-    exit 1
-}
-
-Write-OK "Functions app '$funcAppName' created (VNet + MI + HTTPS-only)."
 
 # Retrieve the managed identity principal ID (enabled at creation via --assign-identity).
 # Enterprise policy enforces allowSharedKeyAccess=false on storage accounts,
@@ -1036,7 +1034,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║                  Deployment Complete!                   ║" -ForegroundColor Green
+Write-Host "║                  Deployment Complete!                    ║" -ForegroundColor Green
 Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 Write-Host "  🌐 App URL:        $swaUrl"       -ForegroundColor White
